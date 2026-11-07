@@ -7,6 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import math
+import json
 import streamlit as st
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -93,7 +97,8 @@ def make_pdf(record):
     for sec in record["sections"]:
         story.append(Paragraph(sec["title"], styles["Section"]))
         data = [["Entry", "Submitted", "Result", "Points"]] + sec["rows"]
-        tab = Table(data, colWidths=[175,150,90,55], repeatRows=1)
+        data = [[Paragraph(str(v), styles["BodyText"]) for v in row] for row in data]
+        tab = Table(data, colWidths=[145,175,85,65], repeatRows=1)
         tab.setStyle(TableStyle([
             ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#003b5c')),('TEXTCOLOR',(0,0),(-1,0),colors.white),
             ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#dfe5ec')),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),5)
@@ -128,7 +133,7 @@ for col, fn, label in [
     p = DATA / fn
     col.download_button(label, p.read_bytes(), file_name=fn, mime="text/csv", use_container_width=True)
 
-st.caption("Complete your calculations outside the app. Enter only your final results below. The app will not reveal the private answer key.")
+st.caption("Complete calculations outside the app. Use the interactive sweep interface to record your vehicle clusters. The app will not reveal the private answer key.")
 
 # ---------- part 1 ----------
 st.subheader("3. Nearest Neighbor + 2-Opt")
@@ -138,10 +143,180 @@ opt_route = st.text_input("2-Opt improved route", placeholder="Depot-F-...-Depot
 opt_dist = st.number_input("2-Opt improved total distance", min_value=0.0, step=0.01, format="%.2f")
 pct_imp = st.number_input("Percentage improvement from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f")
 
+# ---------- interactive sweep heuristic ----------
+def read_sweep_points(csv_path):
+    """Read routing_data.csv without assuming a single header convention.
+
+    Expected: a customer/node identifier and numeric x,y coordinates;
+    optionally a demand/pickup quantity. Depot may be marked by a depot
+    flag or identifier such as Depot / 0. If absent, use (0,0) and say so.
+    """
+    frame = pd.read_csv(csv_path)
+    frame.columns = [str(c).strip() for c in frame.columns]
+    canon = {re.sub(r"[^a-z0-9]", "", c.lower()): c for c in frame.columns}
+    def choose(names):
+        for n in names:
+            if n in canon: return canon[n]
+        return None
+    id_col = choose(["customer", "customerid", "node", "nodeid", "location", "locationid", "stop", "stopid", "id", "point"])
+    x_col = choose(["x", "xcoordinate", "coordx", "longitude", "lon"])
+    y_col = choose(["y", "ycoordinate", "coordy", "latitude", "lat"])
+    q_col = choose(["demand", "quantity", "pickup", "pickupquantity", "volume", "load", "units"])
+    depot_col = choose(["isdepot", "depot", "type", "nodetype"])
+    if not (id_col and x_col and y_col):
+        raise ValueError("routing_data.csv needs customer/node ID, X, and Y columns. Found: " + ", ".join(frame.columns))
+    frame = frame.copy()
+    frame[x_col] = pd.to_numeric(frame[x_col], errors="coerce")
+    frame[y_col] = pd.to_numeric(frame[y_col], errors="coerce")
+    frame = frame.dropna(subset=[x_col,y_col])
+    if frame.empty: raise ValueError("No valid coordinates were found in routing_data.csv")
+    def is_depot(r):
+        label = str(r[id_col]).strip().lower()
+        if label in ("depot", "warehouse", "origin", "dc", "0"): return True
+        if depot_col:
+            v = str(r[depot_col]).strip().lower()
+            return v in ("true", "yes", "1", "depot", "warehouse", "dc")
+        return False
+    depots = frame[frame.apply(is_depot, axis=1)]
+    if len(depots):
+        d = depots.iloc[0]
+        origin = (float(d[x_col]), float(d[y_col]))
+        frame = frame[~frame.apply(is_depot, axis=1)]
+        depot_note = "Depot identified in routing data."
+    else:
+        origin = (0.0, 0.0)
+        depot_note = "No depot row identified; using (0, 0) as the sweep origin. Check the assignment figure."
+    points = []
+    for _,r in frame.iterrows():
+        q = None if not q_col or pd.isna(r[q_col]) else float(r[q_col])
+        points.append({"id":str(r[id_col]).strip(), "x":float(r[x_col]), "y":float(r[y_col]), "demand":q})
+    if len({v["id"] for v in points}) != len(points): raise ValueError("Customer IDs must be unique.")
+    return points, origin, depot_note
+
+
+def sweep_order(points, origin, start_deg, clockwise):
+    # Angle zero points right (+x); positive angles are counterclockwise.
+    def angle(p):
+        return math.degrees(math.atan2(p["y"]-origin[1],p["x"]-origin[0])) % 360
+    return sorted(points, key=lambda p: (((start_deg-angle(p)) if clockwise else (angle(p)-start_deg)) % 360, p["id"]))
+
+
+def draw_sweep(points, origin, angle_deg, clusters, current):
+    fig=go.Figure()
+    all_xy=[origin]+[(p["x"],p["y"]) for p in points]
+    radius=max([math.hypot(x-origin[0],y-origin[1]) for x,y in all_xy] + [1.0])*1.13
+    colorset=["#2563eb", "#059669", "#d97706", "#9333ea", "#dc2626", "#0891b2", "#4f46e5"]
+    lookup={p["id"]:p for p in points}
+    for j, ids in enumerate(clusters + ([current] if current else [])):
+        if not ids: continue
+        xy=[lookup[k] for k in ids if k in lookup]
+        fig.add_trace(go.Scatter(x=[p["x"] for p in xy],y=[p["y"] for p in xy],mode="markers+text",
+            text=[p["id"] for p in xy],textposition="top center",marker=dict(size=15,color=colorset[j%len(colorset)]),
+            name=f"Cluster {j+1}"+(" (building)" if j==len(clusters) else ""),hovertemplate="Customer %{text}<extra></extra>"))
+    assigned={k for c in clusters for k in c}|set(current)
+    remaining=[p for p in points if p["id"] not in assigned]
+    if remaining:
+        fig.add_trace(go.Scatter(x=[p["x"] for p in remaining],y=[p["y"] for p in remaining],mode="markers+text",
+            text=[p["id"] for p in remaining],textposition="top center",marker=dict(size=12,color="#94a3b8"),
+            name="Unassigned",hovertemplate="Customer %{text}<extra></extra>"))
+    rad=math.radians(angle_deg)
+    fig.add_trace(go.Scatter(x=[origin[0],origin[0]+radius*math.cos(rad)],y=[origin[1],origin[1]+radius*math.sin(rad)],
+        mode="lines",line=dict(color="#e11d48",width=3),name="Sweep ray"))
+    fig.add_trace(go.Scatter(x=[origin[0]],y=[origin[1]],mode="markers+text",text=["Depot"],textposition="bottom center",
+        marker=dict(symbol="star",size=17,color="#0f172a"),name="Depot"))
+    fig.update_layout(height=490,margin=dict(l=10,r=10,t=20,b=10),xaxis_title="X coordinate",yaxis_title="Y coordinate",
+        legend=dict(orientation="h",y=-0.19),plot_bgcolor="white")
+    fig.update_yaxes(scaleanchor="x",scaleratio=1)
+    return fig
+
+
 # ---------- part 2 ----------
 st.subheader("4. Sweep Algorithm / VRP")
-vrp_vehicles = st.number_input("Number of vehicles required", min_value=0, step=1)
-vrp_distance = st.number_input("Total distance traveled by all vehicles", min_value=0.0, step=0.01, format="%.2f")
+st.caption("Set a starting ray and choose clockwise or counterclockwise. Build clusters in sweep order. The final cluster membership is recorded in your PDF report.")
+try:
+    sweep_points, sweep_origin, depot_note = read_sweep_points(DATA / "routing_data.csv")
+    st.caption(depot_note)
+    if "sweep_clusters" not in st.session_state: st.session_state.sweep_clusters=[]
+    if "sweep_current" not in st.session_state: st.session_state.sweep_current=[]
+    if "sweep_submitted" not in st.session_state: st.session_state.sweep_submitted=False
+    c1,c2=st.columns([2,1])
+    with c1:
+        sweep_start=st.slider("Starting ray (degrees from positive X-axis)",0,359,0,1,key="sweep_start",disabled=st.session_state.sweep_submitted)
+    with c2:
+        sweep_direction=st.radio("Sweep direction",["Counterclockwise","Clockwise"],horizontal=True,key="sweep_direction",disabled=st.session_state.sweep_submitted)
+    sweep_settings=(sweep_start,sweep_direction)
+    if st.session_state.get("sweep_previous_settings") not in (None,sweep_settings) and not st.session_state.sweep_submitted:
+        st.session_state.sweep_clusters=[]
+        st.session_state.sweep_current=[]
+    st.session_state.sweep_previous_settings=sweep_settings
+    ordered=sweep_order(sweep_points,sweep_origin,sweep_start,sweep_direction=="Clockwise")
+    assigned_ids={k for group in st.session_state.sweep_clusters for k in group}|set(st.session_state.sweep_current)
+    remaining=[p for p in ordered if p["id"] not in assigned_ids]
+    # While building a cluster, show the ray at the next point; otherwise show the selected starting ray.
+    shown_angle=sweep_start
+    if st.session_state.sweep_current and remaining:
+        nxt=remaining[0]
+        shown_angle=math.degrees(math.atan2(nxt["y"]-sweep_origin[1],nxt["x"]-sweep_origin[0]))%360
+    st.plotly_chart(draw_sweep(sweep_points,sweep_origin,shown_angle,st.session_state.sweep_clusters,st.session_state.sweep_current),use_container_width=True)
+    st.caption("Gray = unassigned; colored = assigned clusters; red = sweep ray. Adjust the starting ray and direction before assigning customers.")
+    st.write("**Sweep order:** " + " → ".join(p["id"] for p in ordered))
+    capacity=15000.0
+    lookup={p["id"]:p for p in sweep_points}
+    def load_of(ids):
+        vals=[lookup[k]["demand"] for k in ids]
+        return sum(vals) if all(v is not None for v in vals) else None
+    for idx,grp in enumerate(st.session_state.sweep_clusters,1):
+        ld=load_of(grp)
+        st.write(f"Cluster {idx}: " + ", ".join(grp) + (f" | Load: {ld:,.0f} / {capacity:,.0f}" if ld is not None else ""))
+    cur=st.session_state.sweep_current
+    st.write("**Current cluster:** " + (", ".join(cur) if cur else "(empty)"))
+    if cur and load_of(cur) is not None: st.caption(f"Current load: {load_of(cur):,.0f} / {capacity:,.0f}")
+    if not st.session_state.sweep_submitted:
+        a,b,c=st.columns(3)
+        with a:
+            if st.button("Add next customer",disabled=not remaining,use_container_width=True):
+                candidate=remaining[0]
+                newload=load_of(cur+[candidate["id"]])
+                if newload is not None and newload>capacity:
+                    st.warning("Adding this customer would exceed the 15,000-unit vehicle capacity. Close the current cluster first.")
+                else:
+                    st.session_state.sweep_current=cur+[candidate["id"]]
+                    st.rerun()
+        with b:
+            if st.button("Close cluster / next vehicle",disabled=not cur,use_container_width=True):
+                st.session_state.sweep_clusters.append(list(cur))
+                st.session_state.sweep_current=[]
+                st.rerun()
+        with c:
+            if st.button("Undo last assignment",disabled=not cur,use_container_width=True):
+                st.session_state.sweep_current=cur[:-1]
+                st.rerun()
+        if st.button("Reset sweep clusters",use_container_width=False):
+            st.session_state.sweep_clusters=[]
+            st.session_state.sweep_current=[]
+            st.rerun()
+        all_assigned=(len(remaining)==0)
+        if st.button("Submit Sweep Answer",type="primary",disabled=not all_assigned):
+            if cur:
+                st.session_state.sweep_clusters.append(list(cur))
+                st.session_state.sweep_current=[]
+            st.session_state.sweep_submitted=True
+            st.rerun()
+    else:
+        st.success("Sweep answer submitted. Cluster memberships are locked for the final report.")
+    sweep_cluster_text="; ".join(f"Cluster {i}: {', '.join(group)}" for i,group in enumerate(st.session_state.sweep_clusters,1))
+    if st.session_state.sweep_submitted:
+        st.code(sweep_cluster_text,language=None)
+    vrp_vehicles=st.number_input("Number of vehicles required",min_value=0,step=1,
+        value=len(st.session_state.sweep_clusters) if st.session_state.sweep_submitted else 0,
+        key="vrp_vehicle_count")
+    vrp_distance=st.number_input("Total distance traveled by all vehicles",min_value=0.0,step=0.01,format="%.2f")
+except (FileNotFoundError, ValueError, KeyError) as e:
+    st.error(f"Sweep map unavailable: {e}")
+    st.info("Upload a routing_data.csv with customer ID, X, Y, and optional Demand columns to the data folder.")
+    sweep_cluster_text=""
+    vrp_vehicles=st.number_input("Number of vehicles required",min_value=0,step=1)
+    vrp_distance=st.number_input("Total distance traveled by all vehicles",min_value=0.0,step=0.01,format="%.2f")
 
 # ---------- part 3 ----------
 st.subheader("5. Bin Packing")
@@ -164,7 +339,7 @@ better_distance = st.number_input("Distance saved by 2-Opt compared with Nearest
 
 confirmed = st.checkbox("I have checked these entries against my Excel calculations and am ready to grade them.")
 
-if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed):
+if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed or not st.session_state.get("sweep_submitted", False)):
     rows1=[]; score=0
     checks=[]
     def add(rows,label,submitted,ok,pts):
@@ -184,6 +359,7 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
     score += add(rows1,"% improvement",f"{pct_imp:.2f}%",ok_pct,0.50)
 
     rows2=[]
+    rows2.append(["Sweep clusters", sweep_cluster_text or "Not submitted", "Recorded", "Manual review"])
     ok_v = int(vrp_vehicles) == int(answers["vrp_vehicles"])
     ok_vd = near(vrp_distance, answers["vrp_total_distance"], DIST_TOL)
     score += add(rows2,"Vehicles",vrp_vehicles,ok_v,0.75)
@@ -205,7 +381,7 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
     score += add(rows5,"2-Opt distance saved",f"{better_distance:.2f}",ok_saved,1.0)
 
     timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    payload=f"{nn_route}|{nn_dist}|{opt_route}|{opt_dist}|{pct_imp}|{vrp_vehicles}|{vrp_distance}|{nf}|{bf}|{wf}|{ffd}|{dij_path}|{dij_dist}|{better_distance}"
+    payload=f"{sweep_cluster_text}|{nn_route}|{nn_dist}|{opt_route}|{opt_dist}|{pct_imp}|{vrp_vehicles}|{vrp_distance}|{nf}|{bf}|{wf}|{ffd}|{dij_path}|{dij_dist}|{better_distance}"
     verification=make_verification(name.strip(),student_id.strip(),score,timestamp,payload)
 
     sections=[
