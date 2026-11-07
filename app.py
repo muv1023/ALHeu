@@ -9,6 +9,8 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import base64
+from PIL import Image
 import math
 import json
 import streamlit as st
@@ -143,189 +145,160 @@ opt_route = st.text_input("2-Opt improved route", placeholder="Depot-F-...-Depot
 opt_dist = st.number_input("2-Opt improved total distance", min_value=0.0, step=0.01, format="%.2f")
 pct_imp = st.number_input("Percentage improvement from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f")
 
-# ---------- interactive sweep heuristic ----------
-def read_sweep_points(csv_path):
-    """Read routing_data.csv without assuming a single header convention.
+# ---------- Sweep heuristic directly on the assignment image ----------
+# Positions are pixel locations on assets/sweep_pickup_diagram.png (1728 x 910).
+# IDs are stable labels for recording the clusters; quantities are printed in the image.
+# These coordinates are traced from the supplied illustration, NOT routing_data.csv.
+SWEEP_IMAGE = BASE / "assets" / "sweep_pickup_diagram.png"
+SWEEP_WIDTH, SWEEP_HEIGHT = 1728, 910
+SWEEP_DEPOT = (886, 529)
+SWEEP_POINTS = [
+    {"id":"1", "x":799,"y":132,"demand":4000},
+    {"id":"2", "x":487,"y":295,"demand":3500},
+    {"id":"3", "x":682,"y":257,"demand":3000},
+    {"id":"4", "x":950,"y":253,"demand":2500},
+    {"id":"5", "x":1169,"y":314,"demand":5000},
+    {"id":"6", "x":804,"y":387,"demand":1000},
+    {"id":"7", "x":435,"y":422,"demand":5000},
+    {"id":"8", "x":568,"y":543,"demand":2500},
+    {"id":"9", "x":604,"y":655,"demand":5000},
+    {"id":"10","x":825,"y":678,"demand":2500},
+    {"id":"11","x":1120,"y":482,"demand":2000},
+    {"id":"12","x":1056,"y":598,"demand":4000},
+    {"id":"13","x":1045,"y":745,"demand":2000},
+]
 
-    Expected: a customer/node identifier and numeric x,y coordinates;
-    optionally a demand/pickup quantity. Depot may be marked by a depot
-    flag or identifier such as Depot / 0. If absent, use (0,0) and say so.
-    """
-    frame = pd.read_csv(csv_path)
-    frame.columns = [str(c).strip() for c in frame.columns]
-    canon = {re.sub(r"[^a-z0-9]", "", c.lower()): c for c in frame.columns}
-    def choose(names):
-        for n in names:
-            if n in canon: return canon[n]
-        return None
-    id_col = choose(["customer", "customerid", "node", "nodeid", "location", "locationid", "stop", "stopid", "id", "point"])
-    x_col = choose(["x", "xcoordinate", "coordx", "longitude", "lon"])
-    y_col = choose(["y", "ycoordinate", "coordy", "latitude", "lat"])
-    q_col = choose(["demand", "quantity", "pickup", "pickupquantity", "volume", "load", "units"])
-    depot_col = choose(["isdepot", "depot", "type", "nodetype"])
-    if not (id_col and x_col and y_col):
-        raise ValueError("routing_data.csv needs customer/node ID, X, and Y columns. Found: " + ", ".join(frame.columns))
-    frame = frame.copy()
-    frame[x_col] = pd.to_numeric(frame[x_col], errors="coerce")
-    frame[y_col] = pd.to_numeric(frame[y_col], errors="coerce")
-    frame = frame.dropna(subset=[x_col,y_col])
-    if frame.empty: raise ValueError("No valid coordinates were found in routing_data.csv")
-    def is_depot(r):
-        label = str(r[id_col]).strip().lower()
-        if label in ("depot", "warehouse", "origin", "dc", "0"): return True
-        if depot_col:
-            v = str(r[depot_col]).strip().lower()
-            return v in ("true", "yes", "1", "depot", "warehouse", "dc")
-        return False
-    depots = frame[frame.apply(is_depot, axis=1)]
-    if len(depots):
-        d = depots.iloc[0]
-        origin = (float(d[x_col]), float(d[y_col]))
-        frame = frame[~frame.apply(is_depot, axis=1)]
-        depot_note = "Depot identified in routing data."
-    else:
-        origin = (0.0, 0.0)
-        depot_note = "No depot row identified; using (0, 0) as the sweep origin. Check the assignment figure."
-    points = []
-    for _,r in frame.iterrows():
-        q = None if not q_col or pd.isna(r[q_col]) else float(r[q_col])
-        points.append({"id":str(r[id_col]).strip(), "x":float(r[x_col]), "y":float(r[y_col]), "demand":q})
-    if len({v["id"] for v in points}) != len(points): raise ValueError("Customer IDs must be unique.")
-    return points, origin, depot_note
+def sweep_angle(p):
+    # Image Y grows downward; negate Y to use conventional mathematical angles.
+    return math.degrees(math.atan2(SWEEP_DEPOT[1]-p["y"], p["x"]-SWEEP_DEPOT[0])) % 360
 
+def sweep_order(start, clockwise):
+    return sorted(SWEEP_POINTS, key=lambda p: (((start-sweep_angle(p)) if clockwise else (sweep_angle(p)-start)) % 360, int(p["id"])))
 
-def sweep_order(points, origin, start_deg, clockwise):
-    # Angle zero points right (+x); positive angles are counterclockwise.
-    def angle(p):
-        return math.degrees(math.atan2(p["y"]-origin[1],p["x"]-origin[0])) % 360
-    return sorted(points, key=lambda p: (((start_deg-angle(p)) if clockwise else (angle(p)-start_deg)) % 360, p["id"]))
-
-
-def draw_sweep(points, origin, angle_deg, clusters, current):
+def sweep_figure(angle, groups, active):
     fig=go.Figure()
-    all_xy=[origin]+[(p["x"],p["y"]) for p in points]
-    radius=max([math.hypot(x-origin[0],y-origin[1]) for x,y in all_xy] + [1.0])*1.13
-    colorset=["#2563eb", "#059669", "#d97706", "#9333ea", "#dc2626", "#0891b2", "#4f46e5"]
-    lookup={p["id"]:p for p in points}
-    for j, ids in enumerate(clusters + ([current] if current else [])):
-        if not ids: continue
-        xy=[lookup[k] for k in ids if k in lookup]
-        fig.add_trace(go.Scatter(x=[p["x"] for p in xy],y=[p["y"] for p in xy],mode="markers+text",
-            text=[p["id"] for p in xy],textposition="top center",marker=dict(size=15,color=colorset[j%len(colorset)]),
-            name=f"Cluster {j+1}"+(" (building)" if j==len(clusters) else ""),hovertemplate="Customer %{text}<extra></extra>"))
-    assigned={k for c in clusters for k in c}|set(current)
-    remaining=[p for p in points if p["id"] not in assigned]
-    if remaining:
-        fig.add_trace(go.Scatter(x=[p["x"] for p in remaining],y=[p["y"] for p in remaining],mode="markers+text",
-            text=[p["id"] for p in remaining],textposition="top center",marker=dict(size=12,color="#94a3b8"),
-            name="Unassigned",hovertemplate="Customer %{text}<extra></extra>"))
-    rad=math.radians(angle_deg)
-    fig.add_trace(go.Scatter(x=[origin[0],origin[0]+radius*math.cos(rad)],y=[origin[1],origin[1]+radius*math.sin(rad)],
-        mode="lines",line=dict(color="#e11d48",width=3),name="Sweep ray"))
-    fig.add_trace(go.Scatter(x=[origin[0]],y=[origin[1]],mode="markers+text",text=["Depot"],textposition="bottom center",
-        marker=dict(symbol="star",size=17,color="#0f172a"),name="Depot"))
-    fig.update_layout(height=490,margin=dict(l=10,r=10,t=20,b=10),xaxis_title="X coordinate",yaxis_title="Y coordinate",
-        legend=dict(orientation="h",y=-0.19),plot_bgcolor="white")
-    fig.update_yaxes(scaleanchor="x",scaleratio=1)
+    # Plotly image occupies the exact original image extent; no second map.
+    fig.add_layout_image(dict(source=Image.open(SWEEP_IMAGE),xref="x",yref="y",x=0,y=0,
+                              sizex=SWEEP_WIDTH,sizey=SWEEP_HEIGHT,sizing="stretch",layer="below"))
+    rad=math.radians(angle)
+    radius=620
+    xend=SWEEP_DEPOT[0]+radius*math.cos(rad)
+    yend=SWEEP_DEPOT[1]-radius*math.sin(rad)
+    fig.add_trace(go.Scatter(x=[SWEEP_DEPOT[0],xend],y=[SWEEP_DEPOT[1],yend],mode="lines",
+                             line=dict(color="#e11d48",width=4),name="Movable sweep ray",hoverinfo="skip"))
+    assigned={v for group in groups for v in group}|set(active)
+    palette=["#2563eb","#16a34a","#d97706","#9333ea","#0891b2","#db2777"]
+    for i,group in enumerate(groups+([active] if active else [])):
+        if not group: continue
+        pts=[p for p in SWEEP_POINTS if p["id"] in group]
+        fig.add_trace(go.Scatter(x=[p["x"] for p in pts],y=[p["y"] for p in pts],mode="markers",
+             marker=dict(size=24,color=palette[i%len(palette)],opacity=.30,line=dict(width=2,color=palette[i%len(palette)])),
+             text=[f'Pickup {p["id"]}: {p["demand"]:,} units' for p in pts],hovertemplate="%{text}<extra></extra>",name=f"Cluster {i+1}"))
+    # Tiny numbered tags next to the original black pickup dots for unambiguous answers.
+    fig.add_trace(go.Scatter(x=[p["x"]+22 for p in SWEEP_POINTS],y=[p["y"]-16 for p in SWEEP_POINTS],
+        mode="text",text=[p["id"] for p in SWEEP_POINTS],textfont=dict(color="#075985",size=15,family="Arial Black"),
+        hoverinfo="skip",showlegend=False))
+    fig.update_xaxes(range=[0,SWEEP_WIDTH],visible=False,fixedrange=True)
+    fig.update_yaxes(range=[SWEEP_HEIGHT,0],visible=False,fixedrange=True,scaleanchor="x",scaleratio=1)
+    fig.update_layout(height=570,margin=dict(l=0,r=0,t=5,b=5),paper_bgcolor="white",
+        plot_bgcolor="white",showlegend=True,legend=dict(orientation="h",y=-.04),dragmode=False)
     return fig
 
-
-# ---------- part 2 ----------
 st.subheader("4. Sweep Algorithm / VRP")
-st.caption("Use the assignment pickup diagram as a visual reference, then set the sweep ray and assign customers in the interactive map. Cluster memberships are saved in your PDF report.")
+st.caption("Rotate the red ray directly over the assignment figure. Pickup points are numbered 1-13 in blue; their pickup quantities remain printed in the diagram. Each vehicle can carry at most 15,000 units.")
+if not SWEEP_IMAGE.is_file():
+    st.error("Missing assets/sweep_pickup_diagram.png")
+    st.stop()
 
-# Static assignment diagram. The interactive map below uses the CSV coordinates
-# so that sweep ordering and vehicle capacity checks remain data-driven.
-SWEEP_IMAGE = BASE / "assets" / "sweep_pickup_diagram.png"
-if SWEEP_IMAGE.is_file():
-    st.image(str(SWEEP_IMAGE), caption="Assignment pickup diagram (visual reference; demands shown beside each pickup point)", use_container_width=True)
-else:
-    st.warning("Reference diagram missing. Add assets/sweep_pickup_diagram.png to your GitHub repository.")
+for k,default in {"sweep_clusters":[],"sweep_current":[],"sweep_submitted":False,"sweep_angle":0,"sweep_direction":"Counterclockwise"}.items():
+    if k not in st.session_state: st.session_state[k]=default
 
-try:
-    sweep_points, sweep_origin, depot_note = read_sweep_points(DATA / "routing_data.csv")
-    st.caption(depot_note)
-    if "sweep_clusters" not in st.session_state: st.session_state.sweep_clusters=[]
-    if "sweep_current" not in st.session_state: st.session_state.sweep_current=[]
-    if "sweep_submitted" not in st.session_state: st.session_state.sweep_submitted=False
-    c1,c2=st.columns([2,1])
-    with c1:
-        sweep_start=st.slider("Starting ray (degrees from positive X-axis)",0,359,0,1,key="sweep_start",disabled=st.session_state.sweep_submitted)
-    with c2:
-        sweep_direction=st.radio("Sweep direction",["Counterclockwise","Clockwise"],horizontal=True,key="sweep_direction",disabled=st.session_state.sweep_submitted)
-    sweep_settings=(sweep_start,sweep_direction)
-    if st.session_state.get("sweep_previous_settings") not in (None,sweep_settings) and not st.session_state.sweep_submitted:
-        st.session_state.sweep_clusters=[]
-        st.session_state.sweep_current=[]
-    st.session_state.sweep_previous_settings=sweep_settings
-    ordered=sweep_order(sweep_points,sweep_origin,sweep_start,sweep_direction=="Clockwise")
-    assigned_ids={k for group in st.session_state.sweep_clusters for k in group}|set(st.session_state.sweep_current)
-    remaining=[p for p in ordered if p["id"] not in assigned_ids]
-    # While building a cluster, show the ray at the next point; otherwise show the selected starting ray.
-    shown_angle=sweep_start
-    if st.session_state.sweep_current and remaining:
-        nxt=remaining[0]
-        shown_angle=math.degrees(math.atan2(nxt["y"]-sweep_origin[1],nxt["x"]-sweep_origin[0]))%360
-    st.plotly_chart(draw_sweep(sweep_points,sweep_origin,shown_angle,st.session_state.sweep_clusters,st.session_state.sweep_current),use_container_width=True)
-    st.caption("Gray = unassigned; colored = assigned clusters; red = sweep ray. Adjust the starting ray and direction before assigning customers.")
-    st.write("**Sweep order:** " + " → ".join(p["id"] for p in ordered))
-    capacity=15000.0
-    lookup={p["id"]:p for p in sweep_points}
-    def load_of(ids):
-        vals=[lookup[k]["demand"] for k in ids]
-        return sum(vals) if all(v is not None for v in vals) else None
-    for idx,grp in enumerate(st.session_state.sweep_clusters,1):
-        ld=load_of(grp)
-        st.write(f"Cluster {idx}: " + ", ".join(grp) + (f" | Load: {ld:,.0f} / {capacity:,.0f}" if ld is not None else ""))
-    cur=st.session_state.sweep_current
-    st.write("**Current cluster:** " + (", ".join(cur) if cur else "(empty)"))
-    if cur and load_of(cur) is not None: st.caption(f"Current load: {load_of(cur):,.0f} / {capacity:,.0f}")
+def rotate_ray(amount):
     if not st.session_state.sweep_submitted:
-        a,b,c=st.columns(3)
-        with a:
-            if st.button("Add next customer",disabled=not remaining,use_container_width=True):
-                candidate=remaining[0]
-                newload=load_of(cur+[candidate["id"]])
-                if newload is not None and newload>capacity:
-                    st.warning("Adding this customer would exceed the 15,000-unit vehicle capacity. Close the current cluster first.")
-                else:
-                    st.session_state.sweep_current=cur+[candidate["id"]]
-                    st.rerun()
-        with b:
-            if st.button("Close cluster / next vehicle",disabled=not cur,use_container_width=True):
-                st.session_state.sweep_clusters.append(list(cur))
-                st.session_state.sweep_current=[]
+        st.session_state.sweep_angle=(st.session_state.sweep_angle+amount)%360
+
+c1,c2=st.columns([2,1])
+with c1:
+    angle=st.slider("Ray angle (0 degrees points right)",0,359,key="sweep_angle",disabled=st.session_state.sweep_submitted)
+with c2:
+    direction=st.radio("Sweep direction",["Counterclockwise","Clockwise"],horizontal=True,key="sweep_direction",disabled=st.session_state.sweep_submitted)
+
+r1,r2,r3,r4=st.columns(4)
+with r1: st.button("Rotate 5 degrees clockwise",on_click=rotate_ray,args=(-5,),disabled=st.session_state.sweep_submitted,use_container_width=True)
+with r2: st.button("Rotate 5 degrees anticlockwise",on_click=rotate_ray,args=(5,),disabled=st.session_state.sweep_submitted,use_container_width=True)
+with r3: st.button("Rotate 15 degrees clockwise",on_click=rotate_ray,args=(-15,),disabled=st.session_state.sweep_submitted,use_container_width=True)
+with r4: st.button("Rotate 15 degrees anticlockwise",on_click=rotate_ray,args=(15,),disabled=st.session_state.sweep_submitted,use_container_width=True)
+
+# Changing the start ray while building a cluster would silently change the
+# sequence. Instead, the ray remains freely movable for exploration; only
+# the start angle used for assignments is frozen at first assignment.
+if "sweep_locked_start" not in st.session_state: st.session_state.sweep_locked_start=None
+if "sweep_locked_direction" not in st.session_state: st.session_state.sweep_locked_direction=None
+if st.session_state.sweep_locked_start is None:
+    start_angle=st.session_state.sweep_angle
+    clockwise=direction=="Clockwise"
+else:
+    start_angle=st.session_state.sweep_locked_start
+    clockwise=st.session_state.sweep_locked_direction=="Clockwise"
+
+ordered=sweep_order(start_angle,clockwise)
+assigned={v for group in st.session_state.sweep_clusters for v in group}|set(st.session_state.sweep_current)
+remaining=[p for p in ordered if p["id"] not in assigned]
+st.plotly_chart(sweep_figure(st.session_state.sweep_angle,st.session_state.sweep_clusters,st.session_state.sweep_current),use_container_width=True,config={"displayModeBar":False})
+st.caption("The red ray rotates over the original image. Colored halos indicate assigned pickup points. The blue numbers identify pickup points for the recorded answer.")
+if st.session_state.sweep_locked_start is None:
+    st.write("**Proposed sweep order:** "+" -> ".join(p["id"] for p in ordered))
+else:
+    st.write("**Locked sweep order:** "+" -> ".join(p["id"] for p in ordered))
+
+lookup={p["id"]:p for p in SWEEP_POINTS}
+def load_of(ids): return sum(lookup[v]["demand"] for v in ids)
+for idx,group in enumerate(st.session_state.sweep_clusters,1):
+    st.write(f"**Cluster {idx}:** "+", ".join(group)+f" | Load {load_of(group):,} / 15,000")
+cur=st.session_state.sweep_current
+st.write("**Current cluster:** "+(", ".join(cur) if cur else "(empty)")+f" | Load {load_of(cur):,} / 15,000")
+if not st.session_state.sweep_submitted:
+    a,b,c=st.columns(3)
+    with a:
+        if st.button("Add next pickup",disabled=not remaining,use_container_width=True):
+            candidate=remaining[0]
+            if load_of(cur)+candidate["demand"]>15000:
+                st.warning("Vehicle capacity exceeded. Close this cluster before adding the next pickup.")
+            else:
+                if st.session_state.sweep_locked_start is None:
+                    st.session_state.sweep_locked_start=st.session_state.sweep_angle
+                    st.session_state.sweep_locked_direction=direction
+                st.session_state.sweep_current=cur+[candidate["id"]]
+                st.session_state.sweep_angle=int(round(sweep_angle(candidate)))%360
                 st.rerun()
-        with c:
-            if st.button("Undo last assignment",disabled=not cur,use_container_width=True):
-                st.session_state.sweep_current=cur[:-1]
-                st.rerun()
-        if st.button("Reset sweep clusters",use_container_width=False):
-            st.session_state.sweep_clusters=[]
+    with b:
+        if st.button("Close cluster / next vehicle",disabled=not cur,use_container_width=True):
+            st.session_state.sweep_clusters.append(list(cur))
             st.session_state.sweep_current=[]
             st.rerun()
-        all_assigned=(len(remaining)==0)
-        if st.button("Submit Sweep Answer",type="primary",disabled=not all_assigned):
-            if cur:
-                st.session_state.sweep_clusters.append(list(cur))
-                st.session_state.sweep_current=[]
-            st.session_state.sweep_submitted=True
+    with c:
+        if st.button("Undo last pickup",disabled=not cur,use_container_width=True):
+            st.session_state.sweep_current=cur[:-1]
             st.rerun()
-    else:
-        st.success("Sweep answer submitted. Cluster memberships are locked for the final report.")
-    sweep_cluster_text="; ".join(f"Cluster {i}: {', '.join(group)}" for i,group in enumerate(st.session_state.sweep_clusters,1))
-    if st.session_state.sweep_submitted:
-        st.code(sweep_cluster_text,language=None)
-    vrp_vehicles=st.number_input("Number of vehicles required",min_value=0,step=1,
-        value=len(st.session_state.sweep_clusters) if st.session_state.sweep_submitted else 0,
-        key="vrp_vehicle_count")
-    vrp_distance=st.number_input("Total distance traveled by all vehicles",min_value=0.0,step=0.01,format="%.2f")
-except (FileNotFoundError, ValueError, KeyError) as e:
-    st.error(f"Sweep map unavailable: {e}")
-    st.info("Upload a routing_data.csv with customer ID, X, Y, and optional Demand columns to the data folder.")
-    sweep_cluster_text=""
-    vrp_vehicles=st.number_input("Number of vehicles required",min_value=0,step=1)
-    vrp_distance=st.number_input("Total distance traveled by all vehicles",min_value=0.0,step=0.01,format="%.2f")
+    if st.button("Reset sweep",use_container_width=False):
+        st.session_state.sweep_clusters=[]
+        st.session_state.sweep_current=[]
+        st.session_state.sweep_locked_start=None
+        st.session_state.sweep_locked_direction=None
+        st.rerun()
+    if st.button("Submit Sweep Answer",type="primary",disabled=bool(remaining)):
+        if cur:
+            st.session_state.sweep_clusters.append(list(cur))
+            st.session_state.sweep_current=[]
+        st.session_state.sweep_submitted=True
+        st.rerun()
+else:
+    st.success("Sweep clusters submitted and locked for the final PDF.")
+sweep_cluster_text="; ".join(f"Cluster {i}: {', '.join(group)}" for i,group in enumerate(st.session_state.sweep_clusters,1))
+if st.session_state.sweep_submitted: st.code(sweep_cluster_text,language=None)
+vrp_vehicles=st.number_input("Number of vehicles required",min_value=0,step=1,
+    value=len(st.session_state.sweep_clusters) if st.session_state.sweep_submitted else 0,key="vrp_vehicle_count")
+vrp_distance=st.number_input("Total distance traveled by all vehicles",min_value=0.0,step=0.01,format="%.2f")
 
 # ---------- part 3 ----------
 st.subheader("5. Bin Packing")
