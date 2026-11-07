@@ -232,7 +232,16 @@ def draw_sweep(points, origin, angle_deg, clusters, current):
 
 # ---------- part 2 ----------
 st.subheader("4. Sweep Algorithm / VRP")
-st.caption("Set a starting ray and choose clockwise or counterclockwise. Build clusters in sweep order. The final cluster membership is recorded in your PDF report.")
+st.caption("Use the assignment pickup diagram as a visual reference, then set the sweep ray and assign customers in the interactive map. Cluster memberships are saved in your PDF report.")
+
+# Static assignment diagram. The interactive map below uses the CSV coordinates
+# so that sweep ordering and vehicle capacity checks remain data-driven.
+SWEEP_IMAGE = BASE / "assets" / "sweep_pickup_diagram.png"
+if SWEEP_IMAGE.is_file():
+    st.image(str(SWEEP_IMAGE), caption="Assignment pickup diagram (visual reference; demands shown beside each pickup point)", use_container_width=True)
+else:
+    st.warning("Reference diagram missing. Add assets/sweep_pickup_diagram.png to your GitHub repository.")
+
 try:
     sweep_points, sweep_origin, depot_note = read_sweep_points(DATA / "routing_data.csv")
     st.caption(depot_note)
