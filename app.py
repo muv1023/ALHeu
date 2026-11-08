@@ -40,45 +40,20 @@ st.markdown("""
 <div class="lab-hero">
 <div style="font-size:14px;color:#d7f4f2;">BAN 517 · Module 5</div>
 <h1>Algorithms & Heuristics Decision Lab</h1>
-<div style="font-size:18px;">Solve outside the app. Enter your results here to verify your work.</div>
+<div style="font-size:18px;">Complete the activities and submit your answers for instructor review.</div>
 </div>
 """, unsafe_allow_html=True)
 
-# ---------- configuration ----------
-def get_cfg():
+# ---------- report verification (no grading or answer key) ----------
+def make_verification(name, timestamp, payload):
+    msg = f"{name}|{timestamp}|{payload}".encode("utf-8")
     try:
-        lab = st.secrets["lab"]
-        ans = st.secrets["answers"]
-        return lab, ans
+        salt = str(st.secrets.get("lab", {}).get("verification_salt", ""))
     except Exception:
-        st.error("Instructor setup is incomplete. The private Streamlit Secrets have not been configured.")
-        st.stop()
-
-lab_cfg, answers = get_cfg()
-DIST_TOL = float(lab_cfg.get("distance_tolerance", 0.05))
-PCT_TOL = float(lab_cfg.get("percent_tolerance", 0.10))
-SALT = str(lab_cfg.get("verification_salt", ""))
-
-
-def norm_route(s: str) -> str:
-    parts = [p.strip().upper() for p in re.split(r"(?:->|→|,|;|-)+", s or "") if p.strip()]
-    return "-".join(parts)
-
-
-def near(a, b, tol):
-    try:
-        return abs(float(a) - float(b)) <= tol
-    except Exception:
-        return False
-
-
-def status(ok):
-    return "Correct" if ok else "Incorrect"
-
-
-def make_verification(name, score, timestamp, payload):
-    msg = f"{name}|{score:.2f}|{timestamp}|{payload}".encode()
-    return hmac.new(SALT.encode(), msg, hashlib.sha256).hexdigest()[:16].upper()
+        salt = ""
+    if salt:
+        return hmac.new(salt.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16].upper()
+    return hashlib.sha256(msg).hexdigest()[:16].upper()
 
 
 def make_pdf(record):
@@ -89,9 +64,8 @@ def make_pdf(record):
     styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], textColor=colors.HexColor("#003b5c"), spaceBefore=10, spaceAfter=6))
     story = [Paragraph("BAN 517 Algorithms & Heuristics Decision Lab", styles["Centered"]), Spacer(1, 10)]
     meta = [
-        ["Student", record["name"]],
+        ["Student", escape(record["name"])],
         ["Timestamp (UTC)", record["timestamp"]], ["Verification Code", record["verification"]],
-        ["Automated Score", f'{record["score"]:.2f} / 10.00']
     ]
     t = Table(meta, colWidths=[130, 340])
     t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.HexColor('#dfe5ec')),('BACKGROUND',(0,0),(0,-1),colors.HexColor('#eef7ff')),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),6)]))
@@ -99,9 +73,9 @@ def make_pdf(record):
 
     for sec in record["sections"]:
         story.append(Paragraph(sec["title"], styles["Section"]))
-        data = [["Entry", "Submitted", "Result", "Points"]] + sec["rows"]
-        data = [[Paragraph(str(v), styles["BodyText"]) for v in row] for row in data]
-        tab = Table(data, colWidths=[145,175,85,65], repeatRows=1)
+        data = [["Entry", "Submitted answer"]] + sec["rows"]
+        data = [[Paragraph(escape(str(v)), styles["BodyText"]) for v in row] for row in data]
+        tab = Table(data, colWidths=[170,300], repeatRows=1)
         tab.setStyle(TableStyle([
             ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#003b5c')),('TEXTCOLOR',(0,0),(-1,0),colors.white),
             ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#dfe5ec')),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),5)
@@ -109,7 +83,7 @@ def make_pdf(record):
         story += [tab, Spacer(1,8)]
 
     story.append(Paragraph("Submission Reminder", styles["Section"]))
-    story.append(Paragraph("Submit this verified PDF together with the Excel workbook required in Canvas.", styles["BodyText"]))
+    story.append(Paragraph("Submit this PDF together with the Excel workbook required in Canvas.", styles["BodyText"]))
     doc.build(story)
     buf.seek(0)
     return buf.getvalue()
@@ -132,7 +106,7 @@ for col, fn, label in [
     p = DATA / fn
     col.download_button(label, p.read_bytes(), file_name=fn, mime="text/csv", use_container_width=True)
 
-st.caption("Complete calculations outside the app. Use the interactive sweep interface to record your vehicle clusters. The app will not reveal the private answer key.")
+st.caption("Complete calculations outside the app. Use the interactive sweep interface to record your vehicle clusters.")
 
 # ---------- Route diagram and distance-matrix helpers ----------
 NETWORK_NODES = {
@@ -385,62 +359,52 @@ with nn_right:
 st.subheader("Final comparison")
 better_distance = st.number_input("Distance saved by 2-Opt compared with Nearest Neighbor", min_value=0.0, step=0.01, format="%.2f")
 
-if st.button("Grade Results and Generate Report", type="primary", disabled=not st.session_state.get("sweep_submitted", False) or st.session_state.get("dijkstra_locked") is None or st.session_state.get("nn_locked_v8") is None):
-    rows1=[]; score=0
-    checks=[]
-    def add(rows,label,submitted,ok,pts):
-        nonlocal_dummy = None
-        rows.append([label, str(submitted), status(ok), f"{pts if ok else 0:.2f}"])
-        return pts if ok else 0
-
-    ok_nn_route = norm_route(nn_route) == norm_route(str(answers["nn_route"]))
-    ok_nn_dist = near(nn_dist, answers["nn_distance"], DIST_TOL)
-    ok_opt_route = norm_route(opt_route) == norm_route(str(answers["opt_route"]))
-    ok_opt_dist = near(opt_dist, answers["opt_distance"], DIST_TOL)
-    ok_pct = near(pct_imp, answers["percent_improvement"], PCT_TOL)
-    score += add(rows1,"NN route",nn_route,ok_nn_route,0.50)
-    score += add(rows1,"NN distance",f"{nn_dist:.2f}",ok_nn_dist,0.50)
-    score += add(rows1,"2-Opt route",opt_route,ok_opt_route,0.50)
-    score += add(rows1,"2-Opt distance",f"{opt_dist:.2f}",ok_opt_dist,0.50)
-    score += add(rows1,"% improvement",f"{pct_imp:.2f}%",ok_pct,0.50)
-
-    rows2=[]
-    rows2.append(["Sweep clusters", sweep_cluster_text or "Not submitted", "Recorded", "Manual review"])
-    ok_v = int(vrp_vehicles) == int(answers["vrp_vehicles"])
-    score += add(rows2,"Vehicles",vrp_vehicles,ok_v,2.0)
-
-    rows3=[]
-    for label,val,key in [("Next Fit",nf,"next_fit_bins"),("Best Fit",bf,"best_fit_bins"),("Worst Fit",wf,"worst_fit_bins"),("First Fit Decreasing",ffd,"ffd_bins")]:
-        ok=int(val)==int(answers[key]); score += add(rows3,label,val,ok,0.625)
-
-    rows4=[]
-    ok_dp = norm_route(dij_path) == norm_route(str(answers["dijkstra_path"]))
-    ok_dd = near(dij_dist, answers["dijkstra_distance"], DIST_TOL)
-    score += add(rows4,"Shortest path",dij_path,ok_dp,1.0)
-    score += add(rows4,"Shortest distance",f"{dij_dist:.0f}",ok_dd,1.0)
-
-    rows5=[]
-    expected_saved=float(answers["nn_distance"])-float(answers["opt_distance"])
-    ok_saved=near(better_distance,expected_saved,DIST_TOL)
-    score += add(rows5,"2-Opt distance saved",f"{better_distance:.2f}",ok_saved,1.0)
-
-    timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    payload=f"{sweep_cluster_text}|{nn_route}|{nn_dist}|{opt_route}|{opt_dist}|{pct_imp}|{vrp_vehicles}|{nf}|{bf}|{wf}|{ffd}|{dij_path}|{dij_dist}|{better_distance}"
-    verification=make_verification(name.strip(),score,timestamp,payload)
-
-    sections=[
-        {"title":"Question 1 - Sweep Heuristic / VRP","rows":rows2},
-        {"title":"Question 2 - Shortest Path / Dijkstra","rows":rows4},
-        {"title":"Question 3 - Bin Packing","rows":rows3},
-        {"title":"Question 4 - Nearest Neighbor and 2-Opt","rows":rows1},
-        {"title":"Final Comparison","rows":rows5},
+if st.button(
+    "Generate Submission PDF",
+    type="primary",
+    disabled=(
+        not st.session_state.get("sweep_submitted", False)
+        or st.session_state.get("dijkstra_locked") is None
+        or st.session_state.get("nn_locked_v8") is None
+        or not st.session_state.get("opt_submitted_v8", False)
+    ),
+):
+    # Record submitted values only. No correctness checks or grading are performed.
+    sections = [
+        {"title": "Question 1 - Sweep Heuristic / VRP", "rows": [
+            ["Sweep clusters", sweep_cluster_text or "Not submitted"],
+            ["Number of vehicles", str(vrp_vehicles)],
+        ]},
+        {"title": "Question 2 - Shortest Path / Dijkstra", "rows": [
+            ["Shortest path", str(st.session_state.dijkstra_locked["path"])],
+            ["Shortest distance", f'{float(st.session_state.dijkstra_locked["distance"]):.0f}'],
+        ]},
+        {"title": "Question 3 - Bin Packing", "rows": [
+            ["Next Fit", str(nf)], ["Best Fit", str(bf)],
+            ["Worst Fit", str(wf)], ["First Fit Decreasing", str(ffd)],
+        ]},
+        {"title": "Question 4 - Nearest Neighbor and 2-Opt", "rows": [
+            ["Nearest Neighbor route", nn_route],
+            ["Nearest Neighbor distance (miles)", f"{nn_dist:.2f}"],
+            ["2-Opt improved route", opt_route],
+            ["2-Opt improved distance (miles)", f"{opt_dist:.2f}"],
+            ["Percentage savings", f"{pct_imp:.2f}%"],
+            ["Distance saved (miles)", f"{better_distance:.2f}"],
+        ]},
     ]
-    rec={"name":name.strip(),"timestamp":timestamp,"verification":verification,"score":score,"sections":sections}
-    st.session_state["graded_record"]=rec
-    st.session_state["graded_pdf"]=make_pdf(rec)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    payload = repr(sections)
+    verification = make_verification(name.strip(), timestamp, payload)
+    rec = {"name": name.strip(), "timestamp": timestamp,
+           "verification": verification, "sections": sections}
+    st.session_state["submission_record_v11"] = rec
+    st.session_state["submission_pdf_v11"] = make_pdf(rec)
 
-if "graded_record" in st.session_state:
-    rec=st.session_state["graded_record"]
-    st.success(f'Automated score: {rec["score"]:.2f} / 10.00')
-    st.caption("Incorrect entries are identified, but the private correct answers are not displayed.")
-    st.download_button("Download Verified PDF", st.session_state["graded_pdf"], file_name=f"BAN517_Algorithms_Heuristics_{re.sub(r'[^A-Za-z0-9_-]+', '_', name.strip())}.pdf", mime="application/pdf", use_container_width=True)
+if "submission_record_v11" in st.session_state:
+    st.success("Submission report generated. Download the PDF and upload it to Canvas.")
+    st.download_button(
+        "Download Submission PDF",
+        st.session_state["submission_pdf_v11"],
+        file_name=f"BAN517_Algorithms_Heuristics_{re.sub(r'[^A-Za-z0-9_-]+', '_', name.strip())}.pdf",
+        mime="application/pdf", use_container_width=True,
+    )
