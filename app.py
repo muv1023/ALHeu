@@ -124,7 +124,7 @@ if not name.strip():
 st.subheader("2. Download Assignment Data")
 cols = st.columns(3)
 for col, fn, label in [
-    (cols[0], "routing_data.csv", "Routing / VRP data"),
+    (cols[0], "routing_distance_matrix.csv", "NN / 2-Opt distance matrix"),
     (cols[1], "bin_packing_items.csv", "Bin packing data"),
     (cols[2], "dijkstra_edges.csv", "Dijkstra network data"),
 ]:
@@ -135,9 +135,14 @@ st.caption("Complete calculations outside the app. Use the interactive sweep int
 
 # ---------- part 1 ----------
 st.subheader("3. Nearest Neighbor + 2-Opt")
-nn_route = st.text_input("Nearest Neighbor route", placeholder="Depot-F-...-Depot")
+st.caption("Use the 14 x 14 distance matrix (depot D and customers 1-13) to calculate route distances. The network image is a spatial reference; use matrix distances, not pixel distances.")
+st.image(str(BASE / "assets" / "nearest_neighbor_network.png"), caption="Depot D and 13 customers - spatial network", use_container_width=True)
+with st.expander("View complete distance matrix (miles)"):
+    st.dataframe(pd.read_csv(DATA / "routing_distance_matrix.csv").set_index("From/To"), use_container_width=True)
+
+nn_route = st.text_input("Nearest Neighbor route", placeholder="D-1-...-D")
 nn_dist = st.number_input("Nearest Neighbor total distance", min_value=0.0, step=0.01, format="%.2f")
-opt_route = st.text_input("2-Opt improved route", placeholder="Depot-F-...-Depot")
+opt_route = st.text_input("2-Opt improved route", placeholder="D-1-...-D")
 opt_dist = st.number_input("2-Opt improved total distance", min_value=0.0, step=0.01, format="%.2f")
 pct_imp = st.number_input("Percentage improvement from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f")
 
@@ -263,7 +268,7 @@ if st.session_state.sweep_submitted:
     st.code(sweep_cluster_text, language=None)
 
 vrp_vehicles = st.number_input("Number of vehicles required", min_value=0, step=1, key="vrp_vehicle_count")
-vrp_distance = st.number_input("Total distance traveled by all vehicles", min_value=0.0, step=0.01, format="%.2f")
+
 
 # ---------- part 3 ----------
 st.subheader("5. Bin Packing")
@@ -276,8 +281,22 @@ with b4: ffd = st.number_input("First Fit Decreasing", min_value=0, step=1)
 
 # ---------- part 4 ----------
 st.subheader("6. Dijkstra's Algorithm")
-dij_path = st.text_input("Shortest path from CS to WL", placeholder="CS-...-WL")
-dij_dist = st.number_input("Shortest-path distance", min_value=0.0, step=1.0, format="%.0f")
+if "dijkstra_locked" not in st.session_state:
+    st.session_state.dijkstra_locked = None
+if st.session_state.dijkstra_locked is None:
+    dij_path = st.text_input("Shortest path from CS to WL", placeholder="CS-...-WL", key="dij_path_input")
+    dij_dist = st.number_input("Shortest-path distance", min_value=0.0, step=1.0, format="%.0f", key="dij_distance_input")
+    if st.button("Submit Dijkstra Answer", type="primary", disabled=not dij_path.strip()):
+        st.session_state.dijkstra_locked = {"path": dij_path.strip(), "distance": float(dij_dist)}
+        st.rerun()
+else:
+    dij_path = st.session_state.dijkstra_locked["path"]
+    dij_dist = st.session_state.dijkstra_locked["distance"]
+    st.success("Dijkstra answer submitted and recorded.")
+    st.write(f"Path: {dij_path} | Distance: {dij_dist:.0f}")
+    if st.button("Edit Dijkstra Answer"):
+        st.session_state.dijkstra_locked = None
+        st.rerun()
 
 # ---------- part 5 ----------
 st.subheader("7. Decision Comparison")
@@ -286,7 +305,7 @@ better_distance = st.number_input("Distance saved by 2-Opt compared with Nearest
 
 confirmed = st.checkbox("I have checked these entries against my Excel calculations and am ready to grade them.")
 
-if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed or not st.session_state.get("sweep_submitted", False)):
+if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed or not st.session_state.get("sweep_submitted", False) or st.session_state.get("dijkstra_locked") is None):
     rows1=[]; score=0
     checks=[]
     def add(rows,label,submitted,ok,pts):
@@ -308,9 +327,7 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
     rows2=[]
     rows2.append(["Sweep clusters", sweep_cluster_text or "Not submitted", "Recorded", "Manual review"])
     ok_v = int(vrp_vehicles) == int(answers["vrp_vehicles"])
-    ok_vd = near(vrp_distance, answers["vrp_total_distance"], DIST_TOL)
-    score += add(rows2,"Vehicles",vrp_vehicles,ok_v,0.75)
-    score += add(rows2,"Total VRP distance",f"{vrp_distance:.2f}",ok_vd,1.25)
+    score += add(rows2,"Vehicles",vrp_vehicles,ok_v,2.0)
 
     rows3=[]
     for label,val,key in [("Next Fit",nf,"next_fit_bins"),("Best Fit",bf,"best_fit_bins"),("Worst Fit",wf,"worst_fit_bins"),("First Fit Decreasing",ffd,"ffd_bins")]:
@@ -328,7 +345,7 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
     score += add(rows5,"2-Opt distance saved",f"{better_distance:.2f}",ok_saved,1.0)
 
     timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    payload=f"{sweep_cluster_text}|{nn_route}|{nn_dist}|{opt_route}|{opt_dist}|{pct_imp}|{vrp_vehicles}|{vrp_distance}|{nf}|{bf}|{wf}|{ffd}|{dij_path}|{dij_dist}|{better_distance}"
+    payload=f"{sweep_cluster_text}|{nn_route}|{nn_dist}|{opt_route}|{opt_dist}|{pct_imp}|{vrp_vehicles}|{nf}|{bf}|{wf}|{ffd}|{dij_path}|{dij_dist}|{better_distance}"
     verification=make_verification(name.strip(),score,timestamp,payload)
 
     sections=[
