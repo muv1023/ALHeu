@@ -13,6 +13,7 @@ import base64
 from PIL import Image
 import math
 import json
+from xml.sax.saxutils import escape
 import streamlit as st
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -75,8 +76,8 @@ def status(ok):
     return "Correct" if ok else "Incorrect"
 
 
-def make_verification(name, student_id, score, timestamp, payload):
-    msg = f"{name}|{student_id}|{score:.2f}|{timestamp}|{payload}".encode()
+def make_verification(name, score, timestamp, payload):
+    msg = f"{name}|{score:.2f}|{timestamp}|{payload}".encode()
     return hmac.new(SALT.encode(), msg, hashlib.sha256).hexdigest()[:16].upper()
 
 
@@ -88,7 +89,7 @@ def make_pdf(record):
     styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], textColor=colors.HexColor("#003b5c"), spaceBefore=10, spaceAfter=6))
     story = [Paragraph("BAN 517 Algorithms & Heuristics Decision Lab", styles["Centered"]), Spacer(1, 10)]
     meta = [
-        ["Student", record["name"]], ["Student ID", record["student_id"]],
+        ["Student", record["name"]],
         ["Timestamp (UTC)", record["timestamp"]], ["Verification Code", record["verification"]],
         ["Automated Score", f'{record["score"]:.2f} / 10.00']
     ]
@@ -115,14 +116,10 @@ def make_pdf(record):
 
 # ---------- identity ----------
 st.subheader("1. Student Information")
-c1, c2 = st.columns(2)
-with c1:
-    name = st.text_input("Student name")
-with c2:
-    student_id = st.text_input("Student ID")
+name = st.text_input("Student name")
 
-if not name.strip() or not student_id.strip():
-    st.info("Enter your name and student ID to begin.")
+if not name.strip():
+    st.info("Enter your name to begin.")
     st.stop()
 
 st.subheader("2. Download Assignment Data")
@@ -269,7 +266,7 @@ if not st.session_state.sweep_submitted:
                     st.session_state.sweep_locked_start=st.session_state.sweep_angle
                     st.session_state.sweep_locked_direction=direction
                 st.session_state.sweep_current=cur+[candidate["id"]]
-                st.session_state.sweep_angle=int(round(sweep_angle(candidate)))%360
+                # Do not mutate the slider widget key after it has been instantiated.
                 st.rerun()
     with b:
         if st.button("Close cluster / next vehicle",disabled=not cur,use_container_width=True):
@@ -364,7 +361,7 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
 
     timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     payload=f"{sweep_cluster_text}|{nn_route}|{nn_dist}|{opt_route}|{opt_dist}|{pct_imp}|{vrp_vehicles}|{vrp_distance}|{nf}|{bf}|{wf}|{ffd}|{dij_path}|{dij_dist}|{better_distance}"
-    verification=make_verification(name.strip(),student_id.strip(),score,timestamp,payload)
+    verification=make_verification(name.strip(),score,timestamp,payload)
 
     sections=[
         {"title":"Nearest Neighbor + 2-Opt","rows":rows1},
@@ -373,7 +370,7 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
         {"title":"Dijkstra's Algorithm","rows":rows4},
         {"title":"Decision Comparison","rows":rows5},
     ]
-    rec={"name":name.strip(),"student_id":student_id.strip(),"timestamp":timestamp,"verification":verification,"score":score,"sections":sections}
+    rec={"name":name.strip(),"timestamp":timestamp,"verification":verification,"score":score,"sections":sections}
     st.session_state["graded_record"]=rec
     st.session_state["graded_pdf"]=make_pdf(rec)
 
@@ -381,4 +378,4 @@ if "graded_record" in st.session_state:
     rec=st.session_state["graded_record"]
     st.success(f'Automated score: {rec["score"]:.2f} / 10.00')
     st.caption("Incorrect entries are identified, but the private correct answers are not displayed.")
-    st.download_button("Download Verified PDF", st.session_state["graded_pdf"], file_name=f"BAN517_Algorithms_Heuristics_{student_id.strip()}.pdf", mime="application/pdf", use_container_width=True)
+    st.download_button("Download Verified PDF", st.session_state["graded_pdf"], file_name=f"BAN517_Algorithms_Heuristics_{re.sub(r'[^A-Za-z0-9_-]+', '_', name.strip())}.pdf", mime="application/pdf", use_container_width=True)
