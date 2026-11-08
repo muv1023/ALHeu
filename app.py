@@ -340,8 +340,6 @@ with st.expander("View the 14 x 14 distance matrix (miles)"):
 
 if "nn_locked_v8" not in st.session_state:
     st.session_state.nn_locked_v8 = None
-if "nn_edge_pair_v8" not in st.session_state:
-    st.session_state.nn_edge_pair_v8 = []
 
 nn_left, nn_right = st.columns([1.0, 1.18], gap="large")
 with nn_left:
@@ -354,36 +352,15 @@ with nn_left:
             st.error(err)
         else:
             st.session_state.nn_locked_v8 = parsed
-            st.session_state.nn_edge_pair_v8 = []
             st.rerun()
     if st.session_state.nn_locked_v8:
         st.success("NN route recorded. Its arcs are displayed on the network.")
         if st.button("Clear displayed NN route", use_container_width=True):
             st.session_state.nn_locked_v8 = None
-            st.session_state.nn_edge_pair_v8 = []
             st.rerun()
     st.divider()
     st.markdown("**2-Opt improvement**")
-    st.caption("Identify crossing arcs on the network. Select two nonadjacent arcs to highlight them, then test a 2-Opt exchange. This is a visual aid; you choose the final route.")
-    tour = st.session_state.nn_locked_v8
-    selected_edges = []
-    if tour:
-        edge_options = list(range(len(tour)-1))
-        def edge_label(i):
-            return f"{tour[i]} → {tour[i+1]}"
-        selected_edges = st.multiselect("Select two arcs to inspect", options=edge_options,
-                                        format_func=edge_label, max_selections=2,
-                                        key="nn_edge_select_v8")
-        if len(selected_edges)==2:
-            i,j=sorted(selected_edges)
-            if j == i+1 or (i==0 and j==len(tour)-2):
-                st.info("Choose nonadjacent arcs for a 2-Opt exchange.")
-            else:
-                candidate = tour[:i+1] + list(reversed(tour[i+1:j+1])) + tour[j+1:]
-                st.write("**Candidate after exchange:** " + " → ".join(candidate))
-                if st.button("Use this candidate in 2-Opt field"):
-                    st.session_state.opt_route_v8 = "-".join(candidate)
-                    st.rerun()
+    st.caption("Inspect the displayed NN route for crossing arcs, then enter your improved 2-Opt route and results below.")
     opt_route = st.text_input("2-Opt improved route", placeholder="D-...-D", key="opt_route_v8")
     opt_dist = st.number_input("2-Opt improved distance (miles)", min_value=0.0, step=0.01, format="%.2f", key="opt_distance_v8")
     pct_imp = st.number_input("Percentage savings from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f", key="pct_improvement_v8")
@@ -398,11 +375,10 @@ with nn_left:
 with nn_right:
     st.markdown("**Spatial network and submitted NN route**")
     tour = st.session_state.nn_locked_v8
-    selected = st.session_state.get("nn_edge_select_v8", [])
-    svg = route_network_svg(tour, emphasize=set(selected))
+    svg = route_network_svg(tour)
     components.html(f'<html><body style="margin:0;background:#f5f3eb">{svg}</body></html>', height=610, scrolling=False)
     if tour:
-        st.caption("Teal: NN tour arcs. Pink: selected arcs for possible 2-Opt exchange. Crossings are visual only; the matrix determines route distance.")
+        st.caption("Teal: submitted NN tour arcs. Inspect the diagram for crossings; use the distance matrix to calculate route distance.")
     else:
         st.caption("Submit the NN route in the left panel to overlay its arcs on this diagram.")
 
