@@ -385,9 +385,7 @@ with nn_right:
 st.subheader("Final comparison")
 better_distance = st.number_input("Distance saved by 2-Opt compared with Nearest Neighbor", min_value=0.0, step=0.01, format="%.2f")
 
-confirmed = st.checkbox("I have checked these entries against my Excel calculations and am ready to grade them.")
-
-if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed or not st.session_state.get("sweep_submitted", False) or st.session_state.get("dijkstra_locked") is None or st.session_state.get("nn_locked_v8") is None):
+if st.button("Grade Results and Generate Report", type="primary", disabled=not st.session_state.get("sweep_submitted", False) or st.session_state.get("dijkstra_locked") is None or st.session_state.get("nn_locked_v8") is None):
     rows1=[]; score=0
     checks=[]
     def add(rows,label,submitted,ok,pts):
