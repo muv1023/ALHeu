@@ -1,0 +1,38 @@
+<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;font-family:Arial,sans-serif}#surface{width:100%;touch-action:none;cursor:crosshair;display:block;border:1px solid #d9e2e8;border-radius:10px;background:#fff}.legend{font-size:13px;color:#345;margin:8px 0}button{border:1px solid #bacbd2;background:#f5f9fa;border-radius:7px;padding:7px 10px;cursor:pointer;margin:2px}button:disabled{opacity:.5}#controls{display:flex;flex-wrap:wrap;align-items:center;gap:4px}#angle{font-weight:bold;margin:0 8px}</style></head><body>
+<svg id="surface" viewBox="0 0 1728 910" aria-label="Sweep ray on pickup point image"><image id="bg" x="0" y="0" width="1728" height="910" preserveAspectRatio="none"/><g id="overlay"></g></svg>
+<div id="controls"><button id="cw15">&#8635; 15&deg;</button><button id="cw5">&#8635; 5&deg;</button><span id="angle">0&deg;</span><button id="ccw5">5&deg; &#8634;</button><button id="ccw15">15&deg; &#8634;</button></div>
+<div class="legend" id="hint">Drag the red ray from the depot or click a point on the image to rotate it. A customer highlights when the ray reaches its angle.</div>
+<script>
+const svg=document.getElementById('surface'), layer=document.getElementById('overlay');
+const NS='http://www.w3.org/2000/svg';let args={},angle=0,drag=false,changed=false,lastEvent=null;
+const depot={x:886,y:529};
+function post(type,data){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type},data||{}),'*')}
+function val(){return {angle:Math.round((angle+360)%360),event:++lastEventCounter}}
+let lastEventCounter=0;
+function notify(){if(args.disabled)return;post('streamlit:setComponentValue',{value:val(),dataType:'json'})}
+function nodeAngle(p){return (Math.atan2(depot.y-p.y,p.x-depot.x)*180/Math.PI+360)%360}
+function diff(a,b){return Math.abs(((a-b+540)%360)-180)}
+function selected(){const available=(args.nodes||[]).filter(p=>!(args.assigned||[]).includes(String(p.id)));let nearest=null,dist=Infinity;for(const p of available){let d=diff(nodeAngle(p),angle);if(d<dist){dist=d;nearest=p}}return dist<=7?nearest:null}
+function make(tag,attributes,parent=layer){const el=document.createElementNS(NS,tag);for(const [k,v] of Object.entries(attributes||{}))el.setAttribute(k,v);parent.appendChild(el);return el}
+function draw(){layer.replaceChildren();let r=690,rad=angle*Math.PI/180;
+ make('line',{x1:depot.x,y1:depot.y,x2:depot.x+r*Math.cos(rad),y2:depot.y-r*Math.sin(rad),stroke:'#dc2626','stroke-width':7,'stroke-linecap':'round'});
+ make('circle',{cx:depot.x,cy:depot.y,r:13,fill:'#dc2626',stroke:'white','stroke-width':4});
+ const hit=selected(),palette=['#2563eb','#16a34a','#9333ea','#d97706','#0891b2','#db2777'];
+ (args.nodes||[]).forEach(p=>{let id=String(p.id),index=(args.clusters||[]).findIndex(c=>c.includes(id));let current=(args.current||[]).includes(id),assigned=index>=0||current;let color=index>=0?palette[index%palette.length]:current?palette[(args.clusters||[]).length%palette.length]:'#0f766e';let active=hit&&String(hit.id)===id;
+ make('circle',{cx:p.x,cy:p.y,r:active?28:assigned?22:17,fill:active?'#fbbf24':color,'fill-opacity':active?'.75':assigned?'.30':'.12',stroke:active?'#b45309':color,'stroke-width':active?7:3});
+ make('text',{x:p.x+27,y:p.y-21,fill:active?'#92400e':'#075985','font-size':26,'font-weight':'bold'}).textContent=id;
+ });
+ document.getElementById('angle').textContent=Math.round(angle)+'°';
+ document.getElementById('hint').textContent=hit?'Highlighted customer '+hit.id+'. Use “Add highlighted node” in the right panel.':'Drag the ray to a pickup point. The closest unassigned node highlights within 7°.';
+ for(const id of ['cw15','cw5','ccw5','ccw15'])document.getElementById(id).disabled=!!args.disabled;
+}
+function pointerAngle(e){const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;const transformed=pt.matrixTransform(svg.getScreenCTM().inverse());return (Math.atan2(depot.y-transformed.y,transformed.x-depot.x)*180/Math.PI+360)%360}
+function update(e){if(args.disabled)return;angle=pointerAngle(e);changed=true;draw()}
+svg.addEventListener('pointerdown',e=>{if(args.disabled)return;drag=true;changed=false;svg.setPointerCapture(e.pointerId);update(e)});
+svg.addEventListener('pointermove',e=>{if(drag)update(e)});
+svg.addEventListener('pointerup',e=>{if(!drag)return;drag=false;if(changed)notify()});
+svg.addEventListener('pointercancel',e=>{drag=false});
+for(const [id,step] of Object.entries({cw15:-15,cw5:-5,ccw5:5,ccw15:15}))document.getElementById(id).onclick=()=>{angle=(angle+step+360)%360;draw();notify()};
+window.addEventListener('message',e=>{if(e.data?.type!=='streamlit:render')return;args=e.data.args||{};if(!drag)angle=Number(args.angle||0);if(args.image)document.getElementById('bg').setAttribute('href',args.image);draw();post('streamlit:setFrameHeight',{height:Math.ceil(document.body.scrollHeight+5)})});
+post('streamlit:componentReady',{apiVersion:1});post('streamlit:setFrameHeight',{height:Math.ceil(document.body.scrollHeight+5)});
+</script></body></html>
