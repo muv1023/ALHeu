@@ -19,6 +19,7 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 import streamlit.components.v1 as components
+import html
 
 st.set_page_config(page_title="BAN 517 Algorithms & Heuristics Lab", page_icon="🧭", layout="wide")
 
@@ -27,7 +28,7 @@ DATA = BASE / "data"
 
 st.markdown("""
 <style>
-.block-container {max-width: 1100px; padding-top: 2rem;}
+.block-container {max-width: 1350px; padding-top: 2rem;}
 .lab-hero {background: linear-gradient(135deg,#003b5c 0%,#006c67 55%,#00a6a6 100%);padding:28px;border-radius:18px;color:white;margin-bottom:20px;}
 .lab-hero h1 {color:white;margin:0 0 6px 0;}
 .lab-card {border:1px solid #dfe5ec;border-radius:14px;padding:18px 20px;margin:12px 0 18px 0;background:white;}
@@ -114,14 +115,14 @@ def make_pdf(record):
     return buf.getvalue()
 
 # ---------- identity ----------
-st.subheader("1. Student Information")
+st.subheader("Student Information")
 name = st.text_input("Student name")
 
 if not name.strip():
     st.info("Enter your name to begin.")
     st.stop()
 
-st.subheader("2. Download Assignment Data")
+st.subheader("Download Assignment Data")
 cols = st.columns(3)
 for col, fn, label in [
     (cols[0], "routing_distance_matrix.csv", "NN / 2-Opt distance matrix"),
@@ -133,19 +134,52 @@ for col, fn, label in [
 
 st.caption("Complete calculations outside the app. Use the interactive sweep interface to record your vehicle clusters. The app will not reveal the private answer key.")
 
-# ---------- part 1 ----------
-st.subheader("3. Nearest Neighbor + 2-Opt")
-st.caption("Use the 14 x 14 distance matrix (depot D and customers 1-13) to calculate route distances. The network image is a spatial reference; use matrix distances, not pixel distances.")
-st.image(str(BASE / "assets" / "nearest_neighbor_network.png"), caption="Depot D and 13 customers - spatial network", use_container_width=True)
-with st.expander("View complete distance matrix (miles)"):
-    st.dataframe(pd.read_csv(DATA / "routing_distance_matrix.csv").set_index("From/To"), use_container_width=True)
+# ---------- Route diagram and distance-matrix helpers ----------
+NETWORK_NODES = {
+    "D": (610, 470), "1": (856, 369), "2": (955, 320),
+    "3": (510, 271), "4": (462, 174), "5": (116, 470),
+    "6": (363, 567), "7": (363, 666), "8": (560, 764),
+    "9": (708, 814), "10": (758, 714), "11": (856, 714),
+    "12": (954, 566), "13": (1004, 470),
+}
+CUSTOMERS = {str(i) for i in range(1, 14)}
+MATRIX = pd.read_csv(DATA / "routing_distance_matrix.csv").set_index("From/To")
+MATRIX.index = MATRIX.index.map(str)
+MATRIX.columns = MATRIX.columns.map(str)
 
-nn_route = st.text_input("Nearest Neighbor route", placeholder="D-1-...-D")
-nn_dist = st.number_input("Nearest Neighbor total distance", min_value=0.0, step=0.01, format="%.2f")
-opt_route = st.text_input("2-Opt improved route", placeholder="D-1-...-D")
-opt_dist = st.number_input("2-Opt improved total distance", min_value=0.0, step=0.01, format="%.2f")
-pct_imp = st.number_input("Percentage improvement from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f")
 
+def parse_tour(value):
+    tokens = [x.strip().upper() for x in re.split(r"\s*(?:->|→|,|;|[-–])\s*", value.strip()) if x.strip()]
+    if len(tokens) != 15 or tokens[0] != "D" or tokens[-1] != "D":
+        return None, "Use D-...-D with all 13 customers exactly once."
+    if set(tokens[1:-1]) != CUSTOMERS or len(set(tokens[1:-1])) != 13:
+        return None, "Each customer from 1 through 13 must appear exactly once."
+    return tokens, None
+
+
+def tour_distance(tour):
+    return sum(float(MATRIX.loc[a,b]) for a,b in zip(tour[:-1],tour[1:]))
+
+
+def route_network_svg(tour=None, emphasize=None):
+    # Original network image is the backdrop; route segments are transparent SVG overlays.
+    image_uri = "data:image/png;base64," + base64.b64encode(
+        (BASE / "assets" / "nearest_neighbor_network.png").read_bytes()).decode("ascii")
+    lines = []
+    if tour:
+        for idx, (a,b) in enumerate(zip(tour[:-1],tour[1:])):
+            x1,y1=NETWORK_NODES[a]; x2,y2=NETWORK_NODES[b]
+            is_selected = emphasize is not None and idx in emphasize
+            color = "#e11d48" if is_selected else "#0d9488"
+            width = 7 if is_selected else 4
+            lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="white" stroke-width="{width+3}" stroke-opacity=".85"/>')
+            lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{color}" stroke-width="{width}" stroke-opacity=".9" stroke-linecap="round"/>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1068" style="width:100%;height:auto;display:block">'
+            f'<image href="{image_uri}" x="0" y="0" width="1080" height="1068" preserveAspectRatio="none"/>'
+            + ''.join(lines) + '</svg>')
+
+
+# ---------- Question 4: NN / 2-Opt is rendered after Questions 1-3 ----------
 # ---------- Sweep heuristic: draggable ray on assignment image ----------
 SWEEP_IMAGE = BASE / "assets" / "sweep_pickup_diagram.png"
 SWEEP_DEPOT = (886, 529)
@@ -174,7 +208,7 @@ sweep_component = components.declare_component(
     "ban517_sweep_ray", path=str(BASE / "sweep_component")
 )
 
-st.subheader("4. Sweep Algorithm / VRP")
+st.subheader("Question 1. Sweep Heuristic / Vehicle Routing")
 st.caption("Drag the ray on the pickup-point diagram. When it reaches a customer, that node highlights. Decide which truck receives each node. Calculate truck loads yourself in Excel; this interface does not calculate or display capacity.")
 if not SWEEP_IMAGE.is_file():
     st.error("Missing assets/sweep_pickup_diagram.png")
@@ -270,17 +304,8 @@ if st.session_state.sweep_submitted:
 vrp_vehicles = st.number_input("Number of vehicles required", min_value=0, step=1, key="vrp_vehicle_count")
 
 
-# ---------- part 3 ----------
-st.subheader("5. Bin Packing")
-st.caption("Enter the number of trucks/bins produced by each heuristic. Your Excel workbook should show the complete allocation steps.")
-b1,b2,b3,b4 = st.columns(4)
-with b1: nf = st.number_input("Next Fit", min_value=0, step=1)
-with b2: bf = st.number_input("Best Fit", min_value=0, step=1)
-with b3: wf = st.number_input("Worst Fit", min_value=0, step=1)
-with b4: ffd = st.number_input("First Fit Decreasing", min_value=0, step=1)
-
-# ---------- part 4 ----------
-st.subheader("6. Dijkstra's Algorithm")
+# ---------- Question 2: Shortest path ----------
+st.subheader("Question 2. Shortest Path — Dijkstra's Algorithm")
 if "dijkstra_locked" not in st.session_state:
     st.session_state.dijkstra_locked = None
 if st.session_state.dijkstra_locked is None:
@@ -298,14 +323,95 @@ else:
         st.session_state.dijkstra_locked = None
         st.rerun()
 
-# ---------- part 5 ----------
-st.subheader("7. Decision Comparison")
-st.caption("Use your own results from Parts 1–4.")
+# ---------- part 3 ----------
+st.subheader("Question 3. Bin Packing")
+st.caption("Enter the number of trucks/bins produced by each heuristic. Your Excel workbook should show the complete allocation steps.")
+b1,b2,b3,b4 = st.columns(4)
+with b1: nf = st.number_input("Next Fit", min_value=0, step=1)
+with b2: bf = st.number_input("Best Fit", min_value=0, step=1)
+with b3: wf = st.number_input("Worst Fit", min_value=0, step=1)
+with b4: ffd = st.number_input("First Fit Decreasing", min_value=0, step=1)
+
+# ---------- Question 4: Nearest Neighbor and 2-Opt ----------
+st.subheader("Question 4. Nearest Neighbor and 2-Opt")
+st.caption("Enter your nearest-neighbor tour and submit it to display its arcs on the spatial network. Use the distance matrix for all mileage calculations; the diagram is not drawn to distance scale.")
+with st.expander("View the 14 x 14 distance matrix (miles)"):
+    st.dataframe(MATRIX, use_container_width=True)
+
+if "nn_locked_v8" not in st.session_state:
+    st.session_state.nn_locked_v8 = None
+if "nn_edge_pair_v8" not in st.session_state:
+    st.session_state.nn_edge_pair_v8 = []
+
+nn_left, nn_right = st.columns([1.0, 1.18], gap="large")
+with nn_left:
+    st.markdown("**Nearest Neighbor solution**")
+    nn_route = st.text_input("Nearest Neighbor route", placeholder="D-3-4-...-D", key="nn_route_v8")
+    nn_dist = st.number_input("Nearest Neighbor total distance (miles)", min_value=0.0, step=0.01, format="%.2f", key="nn_distance_v8")
+    if st.button("Submit NN Solution", type="primary", use_container_width=True):
+        parsed, err = parse_tour(nn_route)
+        if err:
+            st.error(err)
+        else:
+            st.session_state.nn_locked_v8 = parsed
+            st.session_state.nn_edge_pair_v8 = []
+            st.rerun()
+    if st.session_state.nn_locked_v8:
+        st.success("NN route recorded. Its arcs are displayed on the network.")
+        if st.button("Clear displayed NN route", use_container_width=True):
+            st.session_state.nn_locked_v8 = None
+            st.session_state.nn_edge_pair_v8 = []
+            st.rerun()
+    st.divider()
+    st.markdown("**2-Opt improvement**")
+    st.caption("Identify crossing arcs on the network. Select two nonadjacent arcs to highlight them, then test a 2-Opt exchange. This is a visual aid; you choose the final route.")
+    tour = st.session_state.nn_locked_v8
+    selected_edges = []
+    if tour:
+        edge_options = list(range(len(tour)-1))
+        def edge_label(i):
+            return f"{tour[i]} → {tour[i+1]}"
+        selected_edges = st.multiselect("Select two arcs to inspect", options=edge_options,
+                                        format_func=edge_label, max_selections=2,
+                                        key="nn_edge_select_v8")
+        if len(selected_edges)==2:
+            i,j=sorted(selected_edges)
+            if j == i+1 or (i==0 and j==len(tour)-2):
+                st.info("Choose nonadjacent arcs for a 2-Opt exchange.")
+            else:
+                candidate = tour[:i+1] + list(reversed(tour[i+1:j+1])) + tour[j+1:]
+                st.write("**Candidate after exchange:** " + " → ".join(candidate))
+                if st.button("Use this candidate in 2-Opt field"):
+                    st.session_state.opt_route_v8 = "-".join(candidate)
+                    st.rerun()
+    opt_route = st.text_input("2-Opt improved route", placeholder="D-...-D", key="opt_route_v8")
+    opt_dist = st.number_input("2-Opt improved distance (miles)", min_value=0.0, step=0.01, format="%.2f", key="opt_distance_v8")
+    pct_imp = st.number_input("Percentage savings from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f", key="pct_improvement_v8")
+    if st.button("Submit 2-Opt Solution", use_container_width=True):
+        parsed, err = parse_tour(opt_route)
+        if err:
+            st.error(err)
+        else:
+            st.session_state.opt_submitted_v8 = True
+            st.success("2-Opt route recorded for the final report.")
+
+with nn_right:
+    st.markdown("**Spatial network and submitted NN route**")
+    tour = st.session_state.nn_locked_v8
+    selected = st.session_state.get("nn_edge_select_v8", [])
+    svg = route_network_svg(tour, emphasize=set(selected))
+    components.html(f'<html><body style="margin:0;background:#f5f3eb">{svg}</body></html>', height=610, scrolling=False)
+    if tour:
+        st.caption("Teal: NN tour arcs. Pink: selected arcs for possible 2-Opt exchange. Crossings are visual only; the matrix determines route distance.")
+    else:
+        st.caption("Submit the NN route in the left panel to overlay its arcs on this diagram.")
+
+st.subheader("Final comparison")
 better_distance = st.number_input("Distance saved by 2-Opt compared with Nearest Neighbor", min_value=0.0, step=0.01, format="%.2f")
 
 confirmed = st.checkbox("I have checked these entries against my Excel calculations and am ready to grade them.")
 
-if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed or not st.session_state.get("sweep_submitted", False) or st.session_state.get("dijkstra_locked") is None):
+if st.button("Grade Results and Generate Report", type="primary", disabled=not confirmed or not st.session_state.get("sweep_submitted", False) or st.session_state.get("dijkstra_locked") is None or st.session_state.get("nn_locked_v8") is None):
     rows1=[]; score=0
     checks=[]
     def add(rows,label,submitted,ok,pts):
@@ -349,11 +455,11 @@ if st.button("Grade Results and Generate Report", type="primary", disabled=not c
     verification=make_verification(name.strip(),score,timestamp,payload)
 
     sections=[
-        {"title":"Nearest Neighbor + 2-Opt","rows":rows1},
-        {"title":"Sweep Algorithm / VRP","rows":rows2},
-        {"title":"Bin Packing","rows":rows3},
-        {"title":"Dijkstra's Algorithm","rows":rows4},
-        {"title":"Decision Comparison","rows":rows5},
+        {"title":"Question 1 - Sweep Heuristic / VRP","rows":rows2},
+        {"title":"Question 2 - Shortest Path / Dijkstra","rows":rows4},
+        {"title":"Question 3 - Bin Packing","rows":rows3},
+        {"title":"Question 4 - Nearest Neighbor and 2-Opt","rows":rows1},
+        {"title":"Final Comparison","rows":rows5},
     ]
     rec={"name":name.strip(),"timestamp":timestamp,"verification":verification,"score":score,"sections":sections}
     st.session_state["graded_record"]=rec
