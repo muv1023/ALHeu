@@ -300,6 +300,7 @@ else:
 
 # ---------- part 3 ----------
 st.subheader("Question 3. Bin Packing")
+st.markdown("**Truck capacity: 100 cubic feet per truck.** Calculate the allocation of items using each bin-packing heuristic.")
 st.caption("Enter the number of trucks/bins produced by each heuristic. Your Excel workbook should show the complete allocation steps.")
 b1,b2,b3,b4 = st.columns(4)
 with b1: nf = st.number_input("Next Fit", min_value=0, step=1)
