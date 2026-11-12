@@ -183,6 +183,7 @@ sweep_component = components.declare_component(
 )
 
 st.subheader("Question 1. Sweep Heuristic / Vehicle Routing")
+st.markdown("**Truck capacity: 15,000 units per truck.** Calculate each truck load yourself and ensure that the total assigned pickup quantity does not exceed this capacity.")
 st.caption("Drag the ray on the pickup-point diagram. When it reaches a customer, that node highlights. Decide which truck receives each node. Calculate truck loads yourself in Excel; this interface does not calculate or display capacity.")
 if not SWEEP_IMAGE.is_file():
     st.error("Missing assets/sweep_pickup_diagram.png")
