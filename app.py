@@ -1,346 +1,412 @@
-import hashlib
-import hmac
 import io
-import json
 import os
 import re
+import hmac
+import hashlib
 from datetime import datetime, timezone
-from html import escape
+from pathlib import Path
 
 import pandas as pd
+import numpy as np
+import base64
+import math
+import json
+from xml.sax.saxutils import escape
 import streamlit as st
-from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+import streamlit.components.v1 as components
+import html
 
-st.set_page_config(page_title="Buy-Back Contract | BAN 517", page_icon="🤝", layout="wide")
+st.set_page_config(page_title="BAN 517 Algorithms & Heuristics Lab", page_icon="🧭", layout="wide")
 
-# v3: Workbook-derived case. Baseline salvage is an external sale, NOT a supplier payment.
-DEMAND = [(12000,.071),(13000,.071),(14000,.143),(15000,.143),
-          (16000,.214),(17000,.070),(18000,.143),(19000,.145)]
-assert abs(sum(prob for _, prob in DEMAND)-1) < 1e-9
-P, SALVAGE, Q, BASE_Q, BASE_W = 95., 42., 15000, 13000, 55.
-FIXED_SUPPLIER_COST = 100000.
-MAX_PROMPTS = 10
-MIN_W, MAX_W, MIN_B, MAX_B = 35., 90., 0., 75.
-TOL = .51
+BASE = Path(__file__).resolve().parent
+DATA = BASE / "data"
 
-st.markdown('''<style>
-.block-container{max-width:1460px;padding-top:1.25rem;padding-bottom:3rem}
-.hero{background:linear-gradient(115deg,#003b5c,#006c67);border-radius:15px;padding:24px 28px;color:white;margin-bottom:17px}
-.hero h1{color:white;margin:4px 0 6px;font-size:2rem}.hero p{color:#e5f5f4;margin:0}
-</style>''', unsafe_allow_html=True)
+st.markdown("""
+<style>
+.block-container {max-width: 1350px; padding-top: 2rem;}
+.lab-hero {background: linear-gradient(135deg,#003b5c 0%,#006c67 55%,#00a6a6 100%);padding:28px;border-radius:18px;color:white;margin-bottom:20px;}
+.lab-hero h1 {color:white;margin:0 0 6px 0;}
+.lab-card {border:1px solid #dfe5ec;border-radius:14px;padding:18px 20px;margin:12px 0 18px 0;background:white;}
+.small-note {color:#52606d;font-size:0.92rem;}
+</style>
+""", unsafe_allow_html=True)
 
-def setting(key, default=None):
-    try: return st.secrets[key]
-    except Exception: return os.getenv(key.upper(), default)
+st.markdown("""
+<div class="lab-hero">
+<div style="font-size:14px;color:#d7f4f2;">BAN 517 · Module 5</div>
+<h1>Algorithms & Heuristics Decision Lab</h1>
+<div style="font-size:18px;">Complete the activities and submit your answers for instructor review.</div>
+</div>
+""", unsafe_allow_html=True)
 
-SECRET = str(setting("scenario_secret", ""))
-OPENAI_KEY = str(setting("OPENAI_API_KEY", ""))
-OPENAI_MODEL = str(setting("openai_model", "gpt-6-luna"))
-
-
-def unsold(q):
-    return sum(prob * max(q-demand, 0) for demand, prob in DEMAND)
-
-
-def buyer_profit(w, b, q=Q, baseline=False):
-    return sum(prob * (P*min(demand,q) - w*q + (SALVAGE if baseline else b)*max(q-demand,0))
-               for demand,prob in DEMAND)
-
-
-def downside(w,b,q=Q,baseline=False):
-    return P*min(DEMAND[0][0],q)-w*q+(SALVAGE if baseline else b)*max(q-DEMAND[0][0],0)
-
-BASE_PROFIT = buyer_profit(BASE_W,0,BASE_Q,baseline=True)
-BASE_LOW = downside(BASE_W,0,BASE_Q,baseline=True)
-
-
-def private_cost(name):
-    # Demo mode is blocked below; never use an unkeyed public hash for graded scenarios.
-    digest=hmac.new(SECRET.encode(),name.strip().casefold().encode(),hashlib.sha256).digest()
-    return 35 + (int.from_bytes(digest[:4],"big")%1101)/100
-
-
-def supplier_profit(w,b,c):
-    return (w-c)*Q-b*unsold(Q)-FIXED_SUPPLIER_COST
-
-
-def supplier_baseline(c):
-    return (BASE_W-c)*BASE_Q-FIXED_SUPPLIER_COST
-
-
-def supplier_decision(w,b,c):
-    return "accept" if (supplier_profit(w,b,c)>supplier_baseline(c)+.01 and buyer_profit(w,b)>BASE_PROFIT+.01) else "reject"
-
-
-def supplier_reply(decision):
-    fallback={
-        "accept":"I can accept these terms. You may lock in the agreement or continue negotiating.",
-        "reject":"I cannot accept these terms. Please reconsider your proposal.",
-        "question":"I am willing to discuss the wholesale and buy-back prices. Please submit a specific proposal for consideration."
-    }[decision]
-    if not OPENAI_KEY: return fallback
+# ---------- report verification (no grading or answer key) ----------
+def make_verification(name, timestamp, payload):
+    msg = f"{name}|{timestamp}|{payload}".encode("utf-8")
     try:
-        from openai import OpenAI
-        client=OpenAI(api_key=OPENAI_KEY,timeout=12.0,max_retries=0)
-        result=client.responses.create(
-            model=OPENAI_MODEL,max_output_tokens=110,
-            instructions=(
-                "You are a professional supplier in a classroom buy-back negotiation. "
-                "Write one concise sentence. Do not disclose costs, profits, reservation conditions, thresholds, "
-                "or numbers, and do not make counteroffers or directional hints. "
-                "The Python decision is authoritative; do not contradict it. "
-                "Only say you accept if the decision is accept."),
-            input=f"Authoritative supplier decision: {decision}. Respond accordingly.")
-        text=(result.output_text or "").strip()
-        if not text or re.search(r"\d|\$|cost|profit|threshold|margin|reservation",text,re.I): return fallback
-        if decision=="accept" and not re.search(r"accept|agree",text,re.I): return fallback
-        if decision=="reject" and not re.search(r"cannot|unable|reject|not accept|decline",text,re.I): return fallback
-        return text
+        salt = str(st.secrets.get("lab", {}).get("verification_salt", ""))
     except Exception:
-        return fallback
+        salt = ""
+    if salt:
+        return hmac.new(salt.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:16].upper()
+    return hashlib.sha256(msg).hexdigest()[:16].upper()
 
 
-def reset():
-    for k in list(st.session_state):
-        if k.startswith("bb_"): del st.session_state[k]
+def make_pdf(record):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, rightMargin=42, leftMargin=42, topMargin=42, bottomMargin=42)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Centered", parent=styles["Title"], alignment=TA_CENTER, textColor=colors.HexColor("#003b5c")))
+    styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], textColor=colors.HexColor("#003b5c"), spaceBefore=10, spaceAfter=6))
+    story = [Paragraph("BAN 517 Algorithms & Heuristics Decision Lab", styles["Centered"]), Spacer(1, 10)]
+    meta = [
+        ["Student", escape(record["name"])],
+        ["Timestamp (UTC)", record["timestamp"]], ["Verification Code", record["verification"]],
+    ]
+    t = Table(meta, colWidths=[130, 340])
+    t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.HexColor('#dfe5ec')),('BACKGROUND',(0,0),(0,-1),colors.HexColor('#eef7ff')),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),6)]))
+    story += [t, Spacer(1,12)]
 
+    for sec in record["sections"]:
+        story.append(Paragraph(sec["title"], styles["Section"]))
+        data = [["Entry", "Submitted answer"]] + sec["rows"]
+        data = [[Paragraph(escape(str(v)), styles["BodyText"]) for v in row] for row in data]
+        tab = Table(data, colWidths=[170,300], repeatRows=1)
+        tab.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#003b5c')),('TEXTCOLOR',(0,0),(-1,0),colors.white),
+            ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#dfe5ec')),('VALIGN',(0,0),(-1,-1),'TOP'),('PADDING',(0,0),(-1,-1),5)
+        ]))
+        story += [tab, Spacer(1,8)]
 
-def initialize(name):
-    st.session_state.bb_name=name.strip()
-    st.session_state.bb_cost=private_cost(name)
-    st.session_state.bb_baseline_verified=False
-    st.session_state.bb_messages=[{"role":"assistant","content":
-        "Welcome. The order quantity is fixed at 15,000 units. I will consider wholesale and buy-back offers. Both firms must improve on their existing arrangement."}]
-    st.session_state.bb_log=[]
-    st.session_state.bb_accepted=[]
-    st.session_state.bb_last=(BASE_W,0.)
-    st.session_state.bb_finished=None
-    st.session_state.bb_final=None
-    st.session_state.bb_started=datetime.now(timezone.utc).isoformat()
-
-
-def finalize():
-    if st.session_state.bb_finished is not None: return
-    accepted=st.session_state.bb_accepted
-    st.session_state.bb_final=max(accepted,key=lambda e:e["buyer_profit"]) if accepted else None
-    st.session_state.bb_finished=datetime.now(timezone.utc).isoformat()
-
-
-def record_prompt(message,decision,offer=None,student_profit=None,carried=""):
-    number=len(st.session_state.bb_log)+1
-    reply=supplier_reply(decision)
-    if carried: reply=carried+" "+reply
-    row={"prompt":number,"message":message,"decision":decision,
-         "wholesale_price":offer[0] if offer else None,
-         "buyback_price":offer[1] if offer else None,
-         "buyer_expected_profit_entered":student_profit,"response":reply}
-    st.session_state.bb_log.append(row)
-    st.session_state.bb_messages.extend([{"role":"user","content":message},
-                                          {"role":"assistant","content":reply}])
-    if decision=="accept":
-        st.session_state.bb_accepted.append({"wholesale_price":offer[0],"buyback_price":offer[1],
-             "buyer_profit":buyer_profit(*offer),"prompt":number})
-    if len(st.session_state.bb_log)>=MAX_PROMPTS: finalize()
-
-
-def export_payload():
-    f=st.session_state.bb_final
-    return {"course":"BAN 517 Supply Chain Analytics","student_name":st.session_state.bb_name,
-        "started_utc":st.session_state.bb_started,"finished_utc":st.session_state.bb_finished,
-        "baseline_expected_profit_entered":st.session_state.bb_baseline_entry,
-        "baseline_expected_profit_verified":True,"baseline_order_quantity":BASE_Q,
-        "baseline_wholesale_price":BASE_W,"baseline_salvage":SALVAGE,"salvage_is_external":True,
-        "prompts_used":len(st.session_state.bb_log),
-        "rejections":sum(e["decision"]=="reject" for e in st.session_state.bb_log),
-        "outcome":"agreement" if f else "no_agreement",
-        "final_contract":({"wholesale_price":f["wholesale_price"],"buyback_price":f["buyback_price"],"order_quantity":Q} if f else None),
-        "buyer_expected_profit":round(f["buyer_profit"],2) if f else None,
-        "gain_over_baseline":round(f["buyer_profit"]-BASE_PROFIT,2) if f else 0,
-        "lowest_demand_profit":round(downside(f["wholesale_price"],f["buyback_price"]),2) if f else None,
-        "baseline_expected_profit":round(BASE_PROFIT,2),"baseline_low_demand_profit":round(BASE_LOW,2),
-        "negotiation_log":st.session_state.bb_log,
-        "buyer_improved":bool(f and f["buyer_profit"]>BASE_PROFIT),
-        "supplier_improved_verified_privately":bool(f),
-        "financial_method":"Baseline external salvage; contract unsold units returned at buyback price."}
-
-
-def pdf_report(payload,code):
-    buffer=io.BytesIO()
-    doc=SimpleDocTemplate(buffer,pagesize=letter,leftMargin=46,rightMargin=46,topMargin=45,bottomMargin=45)
-    styles=getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="BBTitle",parent=styles["Title"],fontSize=17,textColor=colors.HexColor("#003b5c")))
-    story=[Paragraph("Buy-Back Contract Negotiation",styles["BBTitle"]),
-           Paragraph("BAN 517 | Final Decision Lab",styles["Normal"]),Spacer(1,10)]
-    rows=[["Student",payload["student_name"]],["Outcome",payload["outcome"].replace("_"," ").title()],
-          ["Verified baseline expected profit",f'${payload["baseline_expected_profit"]:,.2f}'],
-          ["Prompts used",str(payload["prompts_used"])],["Rejections",str(payload["rejections"])],
-          ["Completed (UTC)",payload["finished_utc"]],["Verification",code]]
-    if payload["final_contract"]:
-        f=payload["final_contract"]
-        rows += [["Wholesale price",f'${f["wholesale_price"]:,.2f}'],
-                 ["Buy-back price",f'${f["buyback_price"]:,.2f}'],["Order quantity",f'{Q:,}'],
-                 ["Expected buyer profit",f'${payload["buyer_expected_profit"]:,.2f}'],
-                 ["Gain over baseline",f'${payload["gain_over_baseline"]:,.2f}'],
-                 ["Lowest-demand buyer profit",f'${payload["lowest_demand_profit"]:,.2f}']]
-    else: rows.append(["Final contract","No agreement reached; baseline is reference only."])
-    table=Table([[Paragraph(escape(str(a)),styles["Normal"]),Paragraph(escape(str(b)),styles["Normal"])] for a,b in rows],colWidths=[200,320])
-    table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.4,colors.HexColor("#dce4ea")),
-        ("BACKGROUND",(0,0),(0,-1),colors.HexColor("#edf5f7")),("VALIGN",(0,0),(-1,-1),"TOP"),
-        ("PADDING",(0,0),(-1,-1),6)]))
-    story.append(table)
-    story.append(Spacer(1,12))
-    story.append(Paragraph("Negotiation record",styles["Heading2"]))
-    for e in payload["negotiation_log"]:
-        story.append(Paragraph(f'<b>Prompt {e["prompt"]}:</b> '+escape(e["message"]),styles["BodyText"]))
-        if e["wholesale_price"] is not None:
-            story.append(Paragraph(f'Offer: w=${e["wholesale_price"]:.2f}, b=${e["buyback_price"]:.2f}; '
-                f'Buyer calculated profit=${e["buyer_expected_profit_entered"]:,.2f}',styles["Normal"]))
-        story.append(Paragraph("Supplier: "+escape(e["response"]),styles["Normal"]))
-        story.append(Spacer(1,6))
-    story.append(Paragraph("BAN 517 | Dr. Manoj Vanajakumari",styles["Normal"]))
+    story.append(Paragraph("Submission Reminder", styles["Section"]))
+    story.append(Paragraph("Submit this PDF together with the Excel workbook required in Canvas.", styles["BodyText"]))
     doc.build(story)
-    return buffer.getvalue()
+    buf.seek(0)
+    return buf.getvalue()
 
-st.markdown('''<div class="hero"><div style="font-size:.8rem;letter-spacing:1px">BAN 517 · FINAL DECISION LAB</div>
-<h1>The Buy-Back Negotiation</h1><p>Analyze the numbers. Negotiate the terms. Own the decision.</p></div>''',unsafe_allow_html=True)
+# ---------- identity ----------
+st.subheader("Student Information")
+name = st.text_input("Student name")
 
-if not SECRET:
-    st.error("Instructor configuration required: set scenario_secret in Streamlit Secrets before using the lab.")
+if not name.strip():
+    st.info("Enter your name to begin.")
     st.stop()
 
-if "bb_name" not in st.session_state:
-    st.subheader("Begin the final negotiation")
-    st.write("You are the buyer. The supplier will negotiate the wholesale and buy-back prices. "
-             "You will calculate expected profits in Excel and enter them before making offers.")
-    name=st.text_input("Student full name",placeholder="First and last name")
-    if st.button("Continue to baseline analysis",type="primary",disabled=not name.strip()):
-        initialize(name);st.rerun()
-    st.caption("BAN 517 · Dr. Manoj Vanajakumari")
+st.subheader("Download Assignment Data")
+cols = st.columns(3)
+for col, fn, label in [
+    (cols[0], "routing_distance_matrix.csv", "NN / 2-Opt distance matrix"),
+    (cols[1], "bin_packing_items.csv", "Bin packing data"),
+    (cols[2], "dijkstra_edges.csv", "Dijkstra network data"),
+]:
+    p = DATA / fn
+    col.download_button(label, p.read_bytes(), file_name=fn, mime="text/csv", use_container_width=True)
+
+st.caption("Complete calculations outside the app. Use the interactive sweep interface to record your vehicle clusters.")
+
+# ---------- Route diagram and distance-matrix helpers ----------
+NETWORK_NODES = {
+    "D": (610, 470), "1": (856, 369), "2": (955, 320),
+    "3": (510, 271), "4": (462, 174), "5": (116, 470),
+    "6": (363, 567), "7": (363, 666), "8": (560, 764),
+    "9": (708, 814), "10": (758, 714), "11": (856, 714),
+    "12": (954, 566), "13": (1004, 470),
+}
+CUSTOMERS = {str(i) for i in range(1, 14)}
+MATRIX = pd.read_csv(DATA / "routing_distance_matrix.csv").set_index("From/To")
+MATRIX.index = MATRIX.index.map(str)
+MATRIX.columns = MATRIX.columns.map(str)
+
+
+def parse_tour(value):
+    tokens = [x.strip().upper() for x in re.split(r"\s*(?:->|→|,|;|[-–])\s*", value.strip()) if x.strip()]
+    if len(tokens) != 15 or tokens[0] != "D" or tokens[-1] != "D":
+        return None, "Use D-...-D with all 13 customers exactly once."
+    if set(tokens[1:-1]) != CUSTOMERS or len(set(tokens[1:-1])) != 13:
+        return None, "Each customer from 1 through 13 must appear exactly once."
+    return tokens, None
+
+
+def tour_distance(tour):
+    return sum(float(MATRIX.loc[a,b]) for a,b in zip(tour[:-1],tour[1:]))
+
+
+def route_network_svg(tour=None, emphasize=None):
+    # Original network image is the backdrop; route segments are transparent SVG overlays.
+    image_uri = "data:image/png;base64," + base64.b64encode(
+        (BASE / "assets" / "nearest_neighbor_network.png").read_bytes()).decode("ascii")
+    lines = []
+    if tour:
+        for idx, (a,b) in enumerate(zip(tour[:-1],tour[1:])):
+            x1,y1=NETWORK_NODES[a]; x2,y2=NETWORK_NODES[b]
+            is_selected = emphasize is not None and idx in emphasize
+            color = "#e11d48" if is_selected else "#0d9488"
+            width = 7 if is_selected else 4
+            lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="white" stroke-width="{width+3}" stroke-opacity=".85"/>')
+            lines.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{color}" stroke-width="{width}" stroke-opacity=".9" stroke-linecap="round"/>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1068" style="width:100%;height:auto;display:block">'
+            f'<image href="{image_uri}" x="0" y="0" width="1080" height="1068" preserveAspectRatio="none"/>'
+            + ''.join(lines) + '</svg>')
+
+
+# ---------- Question 4: NN / 2-Opt is rendered after Questions 1-3 ----------
+# ---------- Sweep heuristic: draggable ray on assignment image ----------
+SWEEP_IMAGE = BASE / "assets" / "sweep_pickup_diagram.png"
+SWEEP_DEPOT = (886, 529)
+SWEEP_POINTS = [
+    {"id":"1", "x":799,"y":132}, {"id":"2", "x":487,"y":295},
+    {"id":"3", "x":682,"y":257}, {"id":"4", "x":950,"y":253},
+    {"id":"5", "x":1169,"y":314}, {"id":"6", "x":804,"y":387},
+    {"id":"7", "x":435,"y":422}, {"id":"8", "x":568,"y":543},
+    {"id":"9", "x":604,"y":655}, {"id":"10","x":825,"y":678},
+    {"id":"11","x":1120,"y":482}, {"id":"12","x":1056,"y":598},
+    {"id":"13","x":1045,"y":745},
+]
+
+
+def point_angle(p):
+    return math.degrees(math.atan2(SWEEP_DEPOT[1]-p["y"], p["x"]-SWEEP_DEPOT[0])) % 360
+
+def angle_distance(a, b):
+    return abs((a-b+180) % 360-180)
+
+@st.cache_data
+def sweep_image_uri():
+    return "data:image/png;base64," + base64.b64encode(SWEEP_IMAGE.read_bytes()).decode("ascii")
+
+sweep_component = components.declare_component(
+    "ban517_sweep_ray", path=str(BASE / "sweep_component")
+)
+
+st.subheader("Question 1. Sweep Heuristic / Vehicle Routing")
+st.markdown("**Truck capacity: 15,000 units per truck.** Calculate each truck load yourself and ensure that the total assigned pickup quantity does not exceed this capacity.")
+st.caption("Drag the ray on the pickup-point diagram. When it reaches a customer, that node highlights. Decide which truck receives each node. Calculate truck loads yourself in Excel; this interface does not calculate or display capacity.")
+if not SWEEP_IMAGE.is_file():
+    st.error("Missing assets/sweep_pickup_diagram.png")
     st.stop()
 
-with st.sidebar:
-    st.header("Contract case")
-    st.write(f"**Student:** {st.session_state.bb_name}")
-    st.metric("Selling price",f"${P:.0f}")
-    st.metric("Salvage value (baseline)",f"${SALVAGE:.0f}")
-    st.metric("Baseline wholesale price",f"${BASE_W:.0f}")
-    st.metric("Baseline order quantity",f"{BASE_Q:,}")
-    st.metric("Negotiated order quantity",f"{Q:,}")
-    st.caption("Baseline salvage comes from an external market; it is not paid by the supplier.")
-    st.write("**Demand scenarios**")
-    st.dataframe(pd.DataFrame(DEMAND,columns=["Demand","Probability"]).style.format({"Demand":"{:,.0f}","Probability":"{:.0%}"}),hide_index=True,use_container_width=True)
-    if st.button("Restart lab"):
-        reset();st.rerun()
+for key, default in {
+    "sweep_clusters": [], "sweep_current": [], "sweep_submitted": False,
+    "sweep_angle_v6": 0, "sweep_event_v6": -1,
+    "sweep_start_v6": None, "sweep_direction_v6": "Counterclockwise",
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-if not st.session_state.bb_baseline_verified:
-    st.subheader("Stage 1 · Establish the no-contract baseline")
-    st.write("In Excel, calculate expected buyer profit for the baseline order of 13,000 units at "
-             "wholesale price $55, with a $42 EXTERNAL salvage value for each unsold unit. "
-             "The supplier does not pay this baseline salvage value. Use the demand probabilities in the sidebar. "
-             "The app will verify your calculation without revealing the answer.")
-    value=st.number_input("Expected baseline buyer profit ($)",value=None,step=100.,format="%.2f")
-    if st.button("Verify baseline and enter negotiation",type="primary",disabled=value is None):
-        if abs(value-BASE_PROFIT)<=TOL:
-            st.session_state.bb_baseline_entry=float(value)
-            st.session_state.bb_baseline_verified=True
-            st.rerun()
-        else:
-            st.error("Your calculation does not match the baseline case. Check the demand probabilities, salvage treatment, and wholesale payment in Excel.")
-    st.stop()
+assigned = {item for cluster in st.session_state.sweep_clusters for item in cluster}
+assigned.update(st.session_state.sweep_current)
 
-st.subheader("Stage 2 · Negotiate the buy-back contract")
-count=len(st.session_state.bb_log)
-st.progress(count/MAX_PROMPTS,text=(f"Prompt {count+1} of {MAX_PROMPTS}" if count<MAX_PROMPTS else "10 of 10 prompts used"))
-
-left,right=st.columns([1.65,1],gap="large")
+left, right = st.columns([1.75, 1], gap="large")
 with left:
-    st.markdown("#### Supplier conversation")
-    for message in st.session_state.bb_messages:
-        with st.chat_message(message["role"]): st.write(message["content"])
-    if st.session_state.bb_finished is None and count<MAX_PROMPTS:
-        with st.form("bb_offer_form",clear_on_submit=False):
-            st.write("**Prepare a contract offer using your Excel calculations**")
-            c1,c2=st.columns(2)
-            with c1: w=st.number_input("Wholesale price ($)",min_value=0.,max_value=300.,value=float(st.session_state.bb_last[0]),step=1.,format="%.2f")
-            with c2: b=st.number_input("Buy-back price ($)",min_value=0.,max_value=300.,value=float(st.session_state.bb_last[1]),step=1.,format="%.2f")
-            student_profit=st.number_input("My expected buyer profit from Excel ($)",value=None,step=100.,format="%.2f")
-            note=st.text_input("Message to supplier (optional)",placeholder="I propose these terms for the 15,000-unit contract.")
-            submitted=st.form_submit_button("Validate and submit offer",type="primary")
-        if submitted:
-            if not (MIN_W<=w<=MAX_W and MIN_B<=b<=MAX_B and b<=w):
-                st.error(f"Use wholesale ${MIN_W:.0f}-${MAX_W:.0f}, buy-back ${MIN_B:.0f}-${MAX_B:.0f}, with buy-back no greater than wholesale. This offer was not submitted.")
-            elif student_profit is None:
-                st.error("Enter your Excel-calculated expected buyer profit before submitting.")
-            elif abs(float(student_profit)-buyer_profit(w,b))>TOL:
-                st.error("Your expected buyer profit does not match these contract terms. Check your Excel calculations and resubmit. This did not use a negotiation prompt.")
-            elif buyer_profit(w,b)<=BASE_PROFIT+.01:
-                st.error("This offer does not improve your buyer profit over the no-contract baseline. Revise your terms before contacting the supplier. No prompt used.")
-            else:
-                decision=supplier_decision(w,b,st.session_state.bb_cost)
-                st.session_state.bb_last=(w,b)
-                message=note.strip() or f"I offer wholesale ${w:.2f} and buy-back ${b:.2f}."
-                record_prompt(message,decision,(w,b),float(student_profit))
-                st.rerun()
-        with st.expander("Ask the supplier a question (uses one prompt)"):
-            question=st.text_input("Question",key="bb_question")
-            if st.button("Send question",disabled=not question.strip()):
-                record_prompt(question,"question")
-                st.rerun()
-    if st.session_state.bb_finished is None:
-        if st.session_state.bb_accepted:
-            st.info("An offer has been accepted and both parties benefit. You can finalize the best accepted contract or continue negotiating.")
-            if st.button("Lock in best accepted contract",type="primary"):
-                finalize();st.rerun()
-        else:
-            st.caption("No offer has been accepted yet.")
-        if st.button("End negotiation now",type="secondary"):
-            finalize();st.rerun()
-    else:
-        st.success("Negotiation complete." if st.session_state.bb_final else "Negotiation ended without an accepted contract.")
+    st.markdown("**Sweep map — drag the red ray**")
+    # The HTML component communicates its final angle to Streamlit on pointer release.
+    sweep_result = sweep_component(
+        image=sweep_image_uri(), nodes=SWEEP_POINTS,
+        angle=st.session_state.sweep_angle_v6,
+        assigned=sorted(assigned), clusters=st.session_state.sweep_clusters,
+        current=st.session_state.sweep_current,
+        disabled=st.session_state.sweep_submitted,
+        key="sweep_ray_component_v6", default=None,
+    )
+    if isinstance(sweep_result, dict):
+        event = int(sweep_result.get("event", -1))
+        if event != st.session_state.sweep_event_v6:
+            st.session_state.sweep_event_v6 = event
+            st.session_state.sweep_angle_v6 = int(round(float(sweep_result.get("angle", 0)))) % 360
+    st.caption("The ray starts at the depot. Drag it to rotate, or use the 5° and 15° controls. No load totals or capacity warnings are shown.")
+
+angle = st.session_state.sweep_angle_v6
+available = [p for p in SWEEP_POINTS if p["id"] not in assigned]
+closest = min(available, key=lambda p: angle_distance(angle, point_angle(p)), default=None)
+hit = closest if closest and angle_distance(angle, point_angle(closest)) <= 7 else None
 
 with right:
-    st.markdown("#### Contract negotiation record")
-    if st.session_state.bb_log:
-        rows=[]
-        for e in st.session_state.bb_log:
-            rows.append({"Prompt":e["prompt"],"Wholesale":f'${e["wholesale_price"]:.2f}' if e["wholesale_price"] is not None else "-",
-                "Buy-back":f'${e["buyback_price"]:.2f}' if e["buyback_price"] is not None else "-",
-                "Buyer profit":f'${e["buyer_expected_profit_entered"]:,.2f}' if e["buyer_expected_profit_entered"] is not None else "-",
-                "Supplier response":e["decision"].title()})
-        st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-    else: st.caption("Verified offers and supplier responses will appear here.")
-    st.caption("Supplier cost, profit, and acceptance threshold remain confidential. A successful contract must benefit both firms.")
-
-if st.session_state.bb_finished is not None:
-    st.divider()
-    st.header("Final negotiation outcome")
-    f=st.session_state.bb_final
-    if f:
-        a,b,c=st.columns(3)
-        a.metric("Wholesale price",f'${f["wholesale_price"]:.2f}')
-        b.metric("Buy-back price",f'${f["buyback_price"]:.2f}')
-        c.metric("Order quantity",f'{Q:,}')
-        a,b,c=st.columns(3)
-        a.metric("Buyer expected profit",f'${f["buyer_profit"]:,.2f}')
-        b.metric("Gain over baseline",f'${f["buyer_profit"]-BASE_PROFIT:,.2f}')
-        c.metric("Profit at lowest demand",f'${downside(f["wholesale_price"],f["buyback_price"]):,.2f}')
+    st.markdown("**Truck assignments**")
+    if not st.session_state.sweep_submitted:
+        if st.session_state.sweep_start_v6 is None:
+            st.radio("Sweep direction", ["Counterclockwise", "Clockwise"], key="sweep_direction_v6", horizontal=True)
+        else:
+            st.caption(f"Sweep direction: {st.session_state.sweep_direction_v6}")
+        st.write(f"**Ray angle:** {angle}°")
+        st.write(f"**Highlighted customer:** {hit['id'] if hit else 'None'}")
+        if st.button("Add highlighted node to current truck", disabled=hit is None, use_container_width=True):
+            if st.session_state.sweep_start_v6 is None:
+                st.session_state.sweep_start_v6 = angle
+            st.session_state.sweep_current.append(hit["id"])
+            st.rerun()
+    st.markdown(f"**Truck {len(st.session_state.sweep_clusters)+1} — Current**")
+    st.write(" → ".join(st.session_state.sweep_current) if st.session_state.sweep_current else "No nodes assigned")
+    if not st.session_state.sweep_submitted:
+        if st.button("Undo last node", disabled=not st.session_state.sweep_current, use_container_width=True):
+            st.session_state.sweep_current.pop()
+            st.rerun()
+        if st.button("Close current truck", disabled=not st.session_state.sweep_current, use_container_width=True):
+            st.session_state.sweep_clusters.append(list(st.session_state.sweep_current))
+            st.session_state.sweep_current = []
+            st.rerun()
+    st.markdown("**Closed trucks**")
+    if not st.session_state.sweep_clusters:
+        st.caption("None yet")
+    for i, cluster in enumerate(st.session_state.sweep_clusters, 1):
+        st.write(f"Truck {i}: Depot → {' → '.join(cluster)} → Depot")
+    st.caption(f"Customers assigned: {len(assigned)} of {len(SWEEP_POINTS)}")
+    if not st.session_state.sweep_submitted:
+        if st.button("Reset all trucks", use_container_width=True):
+            st.session_state.sweep_clusters = []
+            st.session_state.sweep_current = []
+            st.session_state.sweep_start_v6 = None
+            st.rerun()
+        if st.button("Submit sweep answer", type="primary", use_container_width=True,
+                     disabled=(len(assigned) != len(SWEEP_POINTS) or bool(st.session_state.sweep_current))):
+            st.session_state.sweep_submitted = True
+            st.rerun()
+        if len(assigned) == len(SWEEP_POINTS) and st.session_state.sweep_current:
+            st.info("Close the current truck before submitting.")
     else:
-        st.warning("No agreement reached. The baseline is a comparison, not an accepted contract.")
-    st.write(f'**Prompts used:** {len(st.session_state.bb_log)} · **Rejections:** {sum(e["decision"]=="reject" for e in st.session_state.bb_log)}')
-    offers=[{"Prompt":e["prompt"],"Buyer expected profit":e["buyer_expected_profit_entered"]}
-            for e in st.session_state.bb_log if e["buyer_expected_profit_entered"] is not None]
-    if offers:
-        st.markdown("#### Expected buyer profit by offer")
-        st.line_chart(pd.DataFrame(offers).set_index("Prompt"))
-    payload=export_payload()
-    raw=json.dumps(payload,indent=2).encode()
-    verification=hashlib.sha256(raw).hexdigest()[:16].upper()
-    st.caption("Verification reference: "+verification)
-    x,y=st.columns(2)
-    safe_name=re.sub(r"[^A-Za-z0-9_-]+","_",st.session_state.bb_name).strip("_") or "student"
-    x.download_button("Download final PDF",pdf_report(payload,verification),file_name=f"BAN517_Buyback_{safe_name}.pdf",mime="application/pdf",use_container_width=True)
-    y.download_button("Download negotiation JSON",raw,file_name=f"BAN517_Buyback_{safe_name}.json",mime="application/json",use_container_width=True)
-    st.caption("Final course decision lab · Dr. Manoj Vanajakumari")
+        st.success("Sweep answer recorded and locked.")
+
+sweep_cluster_text = "; ".join(
+    f"Truck {i}: Depot → {', '.join(group)} → Depot"
+    for i, group in enumerate(st.session_state.sweep_clusters, 1)
+)
+if st.session_state.sweep_submitted:
+    st.code(sweep_cluster_text, language=None)
+
+vrp_vehicles = st.number_input("Number of vehicles required", min_value=0, step=1, key="vrp_vehicle_count")
+
+
+# ---------- Question 2: Shortest path ----------
+st.subheader("Question 2. Shortest Path — Dijkstra's Algorithm")
+if "dijkstra_locked" not in st.session_state:
+    st.session_state.dijkstra_locked = None
+if st.session_state.dijkstra_locked is None:
+    dij_path = st.text_input("Shortest path from CS to WL", placeholder="CS-...-WL", key="dij_path_input")
+    dij_dist = st.number_input("Shortest-path distance", min_value=0.0, step=1.0, format="%.0f", key="dij_distance_input")
+    if st.button("Submit Dijkstra Answer", type="primary", disabled=not dij_path.strip()):
+        st.session_state.dijkstra_locked = {"path": dij_path.strip(), "distance": float(dij_dist)}
+        st.rerun()
+else:
+    dij_path = st.session_state.dijkstra_locked["path"]
+    dij_dist = st.session_state.dijkstra_locked["distance"]
+    st.success("Dijkstra answer submitted and recorded.")
+    st.write(f"Path: {dij_path} | Distance: {dij_dist:.0f}")
+    if st.button("Edit Dijkstra Answer"):
+        st.session_state.dijkstra_locked = None
+        st.rerun()
+
+# ---------- part 3 ----------
+st.subheader("Question 3. Bin Packing")
+st.markdown("**Truck capacity: 100 cubic feet per truck.** Calculate the allocation of items using each bin-packing heuristic.")
+st.caption("Enter the number of trucks/bins produced by each heuristic. Your Excel workbook should show the complete allocation steps.")
+b1,b2,b3,b4 = st.columns(4)
+with b1: nf = st.number_input("Next Fit", min_value=0, step=1)
+with b2: bf = st.number_input("Best Fit", min_value=0, step=1)
+with b3: wf = st.number_input("Worst Fit", min_value=0, step=1)
+with b4: ffd = st.number_input("First Fit Decreasing", min_value=0, step=1)
+
+# ---------- Question 4: Nearest Neighbor and 2-Opt ----------
+st.subheader("Question 4. Nearest Neighbor and 2-Opt")
+st.caption("Enter your nearest-neighbor tour and submit it to display its arcs on the spatial network. Use the distance matrix for all mileage calculations; the diagram is not drawn to distance scale.")
+with st.expander("View the 14 x 14 distance matrix (miles)"):
+    st.dataframe(MATRIX, use_container_width=True)
+
+if "nn_locked_v8" not in st.session_state:
+    st.session_state.nn_locked_v8 = None
+
+nn_left, nn_right = st.columns([1.0, 1.18], gap="large")
+with nn_left:
+    st.markdown("**Nearest Neighbor solution**")
+    nn_route = st.text_input("Nearest Neighbor route", placeholder="D-3-4-...-D", key="nn_route_v8")
+    nn_dist = st.number_input("Nearest Neighbor total distance (miles)", min_value=0.0, step=0.01, format="%.2f", key="nn_distance_v8")
+    if st.button("Submit NN Solution", type="primary", use_container_width=True):
+        parsed, err = parse_tour(nn_route)
+        if err:
+            st.error(err)
+        else:
+            st.session_state.nn_locked_v8 = parsed
+            st.rerun()
+    if st.session_state.nn_locked_v8:
+        st.success("NN route recorded. Its arcs are displayed on the network.")
+        if st.button("Clear displayed NN route", use_container_width=True):
+            st.session_state.nn_locked_v8 = None
+            st.rerun()
+    st.divider()
+    st.markdown("**2-Opt improvement**")
+    st.caption("Inspect the displayed NN route for crossing arcs, then enter your improved 2-Opt route and results below.")
+    opt_route = st.text_input("2-Opt improved route", placeholder="D-...-D", key="opt_route_v8")
+    opt_dist = st.number_input("2-Opt improved distance (miles)", min_value=0.0, step=0.01, format="%.2f", key="opt_distance_v8")
+    pct_imp = st.number_input("Percentage savings from NN to 2-Opt (%)", min_value=0.0, step=0.01, format="%.2f", key="pct_improvement_v8")
+    if st.button("Submit 2-Opt Solution", use_container_width=True):
+        parsed, err = parse_tour(opt_route)
+        if err:
+            st.error(err)
+        else:
+            st.session_state.opt_submitted_v8 = True
+            st.success("2-Opt route recorded for the final report.")
+
+with nn_right:
+    st.markdown("**Spatial network and submitted NN route**")
+    tour = st.session_state.nn_locked_v8
+    svg = route_network_svg(tour)
+    components.html(f'<html><body style="margin:0;background:#f5f3eb">{svg}</body></html>', height=610, scrolling=False)
+    if tour:
+        st.caption("Teal: submitted NN tour arcs. Inspect the diagram for crossings; use the distance matrix to calculate route distance.")
+    else:
+        st.caption("Submit the NN route in the left panel to overlay its arcs on this diagram.")
+
+st.subheader("Final comparison")
+better_distance = st.number_input("Distance saved by 2-Opt compared with Nearest Neighbor", min_value=0.0, step=0.01, format="%.2f")
+
+if st.button(
+    "Generate Submission PDF",
+    type="primary",
+    disabled=(
+        not st.session_state.get("sweep_submitted", False)
+        or st.session_state.get("dijkstra_locked") is None
+        or st.session_state.get("nn_locked_v8") is None
+        or not st.session_state.get("opt_submitted_v8", False)
+    ),
+):
+    # Record submitted values only. No correctness checks or grading are performed.
+    sections = [
+        {"title": "Question 1 - Sweep Heuristic / VRP", "rows": [
+            ["Sweep clusters", sweep_cluster_text or "Not submitted"],
+            ["Number of vehicles", str(vrp_vehicles)],
+        ]},
+        {"title": "Question 2 - Shortest Path / Dijkstra", "rows": [
+            ["Shortest path", str(st.session_state.dijkstra_locked["path"])],
+            ["Shortest distance", f'{float(st.session_state.dijkstra_locked["distance"]):.0f}'],
+        ]},
+        {"title": "Question 3 - Bin Packing", "rows": [
+            ["Next Fit", str(nf)], ["Best Fit", str(bf)],
+            ["Worst Fit", str(wf)], ["First Fit Decreasing", str(ffd)],
+        ]},
+        {"title": "Question 4 - Nearest Neighbor and 2-Opt", "rows": [
+            ["Nearest Neighbor route", nn_route],
+            ["Nearest Neighbor distance (miles)", f"{nn_dist:.2f}"],
+            ["2-Opt improved route", opt_route],
+            ["2-Opt improved distance (miles)", f"{opt_dist:.2f}"],
+            ["Percentage savings", f"{pct_imp:.2f}%"],
+            ["Distance saved (miles)", f"{better_distance:.2f}"],
+        ]},
+    ]
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    payload = repr(sections)
+    verification = make_verification(name.strip(), timestamp, payload)
+    rec = {"name": name.strip(), "timestamp": timestamp,
+           "verification": verification, "sections": sections}
+    st.session_state["submission_record_v11"] = rec
+    st.session_state["submission_pdf_v11"] = make_pdf(rec)
+
+if "submission_record_v11" in st.session_state:
+    st.success("Submission report generated. Download the PDF and upload it to Canvas.")
+    st.download_button(
+        "Download Submission PDF",
+        st.session_state["submission_pdf_v11"],
+        file_name=f"BAN517_Algorithms_Heuristics_{re.sub(r'[^A-Za-z0-9_-]+', '_', name.strip())}.pdf",
+        mime="application/pdf", use_container_width=True,
+    )
